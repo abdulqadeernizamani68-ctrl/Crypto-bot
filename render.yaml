@@ -1,0 +1,30 @@
+services:
+  - type: web
+    name: whatsapp-crypto-signal-bot
+    env: node
+    plan: starter
+    buildCommand: npm install
+    startCommand: npm start
+    envVars:
+      - key: BINANCE_API_KEY
+        sync: false
+      - key: BINANCE_API_SECRET
+        sync: false
+      - key: BINANCE_USE_FUTURES
+        value: "true"
+      - key: UPSTASH_REDIS_REST_URL
+        sync: false
+      - key: UPSTASH_REDIS_REST_TOKEN
+        sync: false
+      - key: WA_PHONE_NUMBER
+        sync: false
+      - key: WA_ALLOWED_NUMBERS
+        sync: false
+      - key: MIN_CONFIDENCE
+        value: "65"
+      - key: MIN_ALIGNED_CATEGORIES
+        value: "4"
+      - key: MIN_RISK_REWARD
+        value: "1.5"
+      - key: ADAPTIVE_MIN_SAMPLES
+        value: "20"
