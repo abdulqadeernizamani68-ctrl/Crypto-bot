@@ -50,7 +50,8 @@ async function startWhatsApp() {
   // scan a QR code). Only triggered when there is no existing session.
   if (!state.creds.registered && config.wa.phoneNumber) {
     try {
-      const code = await sock.requestPairingCode(config.wa.phoneNumber);
+      await new Promise((resolve) => setTimeout(resolve, 3000));
+     const code = await sock.requestPairingCode(config.wa.phoneNumber);
       logger.info('=================================================');
       logger.info(`WhatsApp pairing code: ${code}`);
       logger.info('Open WhatsApp -> Linked Devices -> Link with phone number, and enter this code.');
