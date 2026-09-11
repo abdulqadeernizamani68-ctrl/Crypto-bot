@@ -15,12 +15,8 @@ module.exports = {
     url: process.env.UPSTASH_REDIS_REST_URL,
     token: process.env.UPSTASH_REDIS_REST_TOKEN,
   },
-  wa: {
-    phoneNumber: (process.env.WA_PHONE_NUMBER || '').replace(/\D/g, ''),
-    allowedNumbers: (process.env.WA_ALLOWED_NUMBERS || '')
-      .split(',')
-      .map((s) => s.replace(/\D/g, ''))
-      .filter(Boolean),
+discord: {
+    token: process.env.DISCORD_BOT_TOKEN || '',
   },
   server: {
     port: num(process.env.PORT, 3000),
