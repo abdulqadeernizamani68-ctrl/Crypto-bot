@@ -3,7 +3,7 @@ const cron = require('node-cron');
 const {
   default: makeWASocket,
   DisconnectReason,
-  fetchLatestWaWebVersion,
+  fetchLatestWaWebVersion,Browsers,
 } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 
@@ -42,7 +42,7 @@ async function startWhatsApp() {
     version,
     auth: state,
     printQRInTerminal: false,
-    browser: ['CryptoSignalBot', 'Chrome', '1.0'],
+    browser: Browsers.ubuntu('Chrome'),
   });
   sockInstance = sock;
 
