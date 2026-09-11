@@ -1,26 +1,15 @@
-const express = require('express');
+
+  const express = require('express');
 const cron = require('node-cron');
-const {
-  default: makeWASocket,
-  DisconnectReason,
-  fetchLatestWaWebVersion,Browsers,
-} = require('@whiskeysockets/baileys');
-const { Boom } = require('@hapi/boom');
+const { Client, GatewayIntentBits, Partials } = require('discord.js');
 
 const config = require('./config');
 const logger = require('./utils/logger');
-const { useRedisAuthState } = require('./services/waAuthState');
 const { handleSignalCommand } = require('./commands/signal');
 const { handleAccuracyCommand } = require('./commands/accuracy');
 const { runTrackerCycle } = require('./services/tracker');
 
-let sockInstance = null;
-
-function isAllowed(jid) {
-  if (!config.wa.allowedNumbers.length) return true;
-  const number = jid.split('@')[0].split(':')[0];
-  return config.wa.allowedNumbers.includes(number);
-}
+let clientInstance = null;
 
 async function routeCommand(text) {
   const trimmed = text.trim();
@@ -31,96 +20,56 @@ async function routeCommand(text) {
   if (/^!accuracy\b/i.test(trimmed)) {
     return handleAccuracyCommand();
   }
-  return null; // not a recognized command - stay silent
+  return null;
 }
 
-async function startWhatsApp() {
-  const { state, saveCreds } = await useRedisAuthState();
-  const { version } = await fetchLatestWaWebVersion();
-
-  const sock = makeWASocket({
-    version,
-    auth: state,
-    printQRInTerminal: false,
-    browser: Browsers.ubuntu('Chrome'),
+function startDiscordBot() {
+  const client = new Client({
+    intents: [
+      GatewayIntentBits.Guilds,
+      GatewayIntentBits.GuildMessages,
+      GatewayIntentBits.MessageContent,
+      GatewayIntentBits.DirectMessages,
+    ],
+    partials: [Partials.Channel],
   });
-  sockInstance = sock;
+  clientInstance = client;
 
-  // Headless pairing-code login (works on hosts like Render with no way to
-  // scan a QR code). Only triggered when there is no existing session.
-  if (!state.creds.registered && config.wa.phoneNumber) {
+  client.once('ready', () => {
+    logger.info(`Discord bot logged in as ${client.user.tag}`);
+  });
+
+  client.on('messageCreate', async (message) => {
+    if (message.author.bot) return;
+    const text = message.content || '';
+    if (!text.trim().startsWith('!')) return;
+
+    logger.info(`Command from ${message.author.tag}: ${text}`);
     try {
-      await new Promise((resolve) => setTimeout(resolve, 3000));
-     const code = await sock.requestPairingCode(config.wa.phoneNumber);
-      logger.info('=================================================');
-      logger.info(`WhatsApp pairing code: ${code}`);
-      logger.info('Open WhatsApp -> Linked Devices -> Link with phone number, and enter this code.');
-      logger.info('=================================================');
+      const reply = await routeCommand(text);
+      if (reply) {
+        await message.reply(reply);
+      }
     } catch (err) {
-      logger.error('Failed to request pairing code:', err.message);
-    }
-  }
-
-  sock.ev.on('creds.update', saveCreds);
-
-  sock.ev.on('connection.update', (update) => {
-    const { connection, lastDisconnect } = update;
-    if (connection === 'close') {
-      const statusCode = new Boom(lastDisconnect?.error)?.output?.statusCode;
-      const shouldReconnect = statusCode !== DisconnectReason.loggedOut;
-      logger.warn(`WhatsApp connection closed (code ${statusCode}). Reconnecting: ${shouldReconnect}`);
-      if (shouldReconnect) {
-        startWhatsApp().catch((e) => logger.error('Reconnect failed:', e.message));
-      } else {
-        logger.error('Logged out. Delete the wa:auth:* keys in Redis and restart to re-link.');
-      }
-    } else if (connection === 'open') {
-      logger.info('WhatsApp connection established.');
+      logger.error('Command handling error:', err.message);
+      await message.reply(`Error: ${err.message}`).catch(() => {});
     }
   });
 
-  sock.ev.on('messages.upsert', async ({ messages, type }) => {
-    if (type !== 'notify') return;
-    for (const msg of messages) {
-      if (!msg.message || msg.key.fromMe) continue;
-      const jid = msg.key.remoteJid;
-      if (!jid || jid.endsWith('@g.us')) continue; // ignore group chats
-      if (!isAllowed(jid)) continue;
-
-      const text =
-        msg.message.conversation ||
-        msg.message.extendedTextMessage?.text ||
-        '';
-      if (!text || !text.trim().startsWith('!')) continue;
-
-      logger.info(`Command from ${jid}: ${text}`);
-      try {
-        const reply = await routeCommand(text);
-        if (reply) {
-          await sock.sendMessage(jid, { text: reply });
-        }
-      } catch (err) {
-        logger.error('Command handling error:', err.message);
-        await sock.sendMessage(jid, { text: `Error: ${err.message}` }).catch(() => {});
-      }
-    }
-  });
-
-  return sock;
+  client.login(config.discord.token);
+  return client;
 }
 
 function startHealthServer() {
   const app = express();
-  app.get('/', (req, res) => res.send('WhatsApp Crypto Signal Bot is running.'));
-  app.get('/health', (req, res) => res.json({ ok: true, connected: !!sockInstance }));
+  app.get('/', (req, res) => res.send('Crypto Signal Bot (Discord) is running.'));
+  app.get('/health', (req, res) => res.json({ ok: true, connected: !!clientInstance?.isReady() }));
   app.listen(config.server.port, () => {
     logger.info(`Health server listening on port ${config.server.port}`);
   });
 }
 
 function startTrackerCron() {
-  // Every 2 minutes: cheap enough for Upstash's free tier while still giving
-  // reasonably tight MFE/MAE and TP/SL hit resolution.
   cron.schedule('*/2 * * * *', () => {
     runTrackerCycle().catch((err) => logger.error('Tracker cycle failed:', err.message));
   });
@@ -129,7 +78,7 @@ function startTrackerCron() {
 
 async function main() {
   startHealthServer();
-  await startWhatsApp();
+  startDiscordBot();
   startTrackerCron();
 }
 
