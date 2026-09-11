@@ -3,7 +3,7 @@ const cron = require('node-cron');
 const {
   default: makeWASocket,
   DisconnectReason,
-  fetchLatestBaileysVersion,
+  fetchLatestWaWebVersion,
 } = require('@whiskeysockets/baileys');
 const { Boom } = require('@hapi/boom');
 
@@ -36,7 +36,7 @@ async function routeCommand(text) {
 
 async function startWhatsApp() {
   const { state, saveCreds } = await useRedisAuthState();
-  const { version } = await fetchLatestBaileysVersion();
+  const { version } = await fetchLatestWaWebVersion();
 
   const sock = makeWASocket({
     version,
