@@ -22,8 +22,27 @@ function trapAndConditionLines(signal) {
   return lines;
 }
 
-function formatSignalMessage(signal) {
+// Extended (structural) invalidation level + real, historically-measured
+// recovery odds at several time horizons. Any checkpoint without enough
+// accumulated history says so explicitly instead of guessing.
+function formatExtendedInvalidation(ext) {
+  const lines = [`Extended Stop Loss (structural invalidation): ${fmtNum(ext.level)}`];
+  lines.push(`Agar ye level hit ho, ${fmtNum(ext.referencePrice)} tak wapas aane ke chances (is pair ki apni history se):`);
+  ext.checkpoints.forEach((cp) => {
+    if (cp.samples < cp.minSamples) {
+      lines.push(`- ${cp.label}: not enough historical data yet (n=${cp.samples}/${cp.minSamples})`);
+    } else {
+      lines.push(`- ${cp.label}: ${cp.probabilityPct}% (n=${cp.samples})`);
+    }
+  });
+  return lines.join('\n');
+}
+
+function formatSignalMessage(signal, { detailed = false } = {}) {
   if (signal.direction === 'NO TRADE') {
+    if (!detailed) {
+      return [...paperPrefix(signal), '*NO TRADE*', '', 'Market conditions not favorable.'].join('\n');
+    }
     const reasons = signal.reason && signal.reason.length ? signal.reason.map((r) => `- ${r}`).join('\n') : '- Conditions not aligned';
     return [
       ...paperPrefix(signal),
@@ -36,6 +55,21 @@ function formatSignalMessage(signal) {
       '',
       'Reason:',
       reasons,
+      ...(signal.topInvalidationFactors && signal.topInvalidationFactors.length
+        ? ['', 'Kyun trade nahi (detected factors):', ...signal.topInvalidationFactors.map((r) => `- ${r}`)]
+        : []),
+    ].join('\n');
+  }
+
+  if (!detailed) {
+    return [
+      ...paperPrefix(signal),
+      `*${signal.direction}*`,
+      '',
+      `Entry: ${fmtNum(signal.entry)}`,
+      `TP: ${fmtNum(signal.takeProfit)}`,
+      `SL: ${fmtNum(signal.stopLoss)}`,
+      `Confidence: ${signal.confidence}%`,
     ].join('\n');
   }
 
@@ -49,11 +83,35 @@ function formatSignalMessage(signal) {
     `Take Profit: ${fmtNum(signal.takeProfit)}`,
     `Risk:Reward: 1:${signal.riskReward}`,
     `Confidence: ${signal.confidence}%`,
+    `Grade: ${signal.grade}`,
     `Valid for: ${signal.validityMinutes} minutes`,
     '',
-    `Market Regime: ${signal.regime.trend} / ${signal.regime.volatility}`,
+    `Market Regime: ${signal.regime.trend} (${signal.regime.directionalTrend || '-'}) / ${signal.regime.volatility}`,
     `Aligned categories: ${Object.values(signal.categoryScores).filter((c) => Math.sign(c.score) === (signal.direction === 'BUY' ? 1 : -1) && Math.abs(c.score) > 0.1).length}/${Object.keys(signal.categoryScores).length}`,
+    ...(signal.expectedValue
+      ? [
+          '',
+          `Win Probability: ${signal.expectedValue.winProbability}%  |  Loss Probability: ${signal.expectedValue.lossProbability}%`,
+          `Expected Value: ${signal.expectedValue.expectedValueR}R`,
+        ]
+      : []),
+    ...(signal.featureImportance && signal.featureImportance.length
+      ? ['', 'Feature Importance (what mattered most for this score):', ...signal.featureImportance.slice(0, 6).map((f) => `- ${f.category}: ${f.importancePct}% (score ${f.score})`)]
+      : []),
+    ...(signal.anomalies && signal.anomalies.length
+      ? ['', 'Anomaly flags:', ...signal.anomalies.map((a) => `- ${a.type} (${a.severity}): ${a.note}`)]
+      : []),
+    ...(signal.topConfirmations && signal.topConfirmations.length
+      ? ['', 'Kyun ye trade (confirming factors):', ...signal.topConfirmations.map((r) => `- ${r}`)]
+      : []),
+    ...(signal.topInvalidationFactors && signal.topInvalidationFactors.length
+      ? ['', 'Risk / disagreeing factors:', ...signal.topInvalidationFactors.map((r) => `- ${r}`)]
+      : []),
     ...trapAndConditionLines(signal),
+    ...(signal.extendedInvalidation ? ['', formatExtendedInvalidation(signal.extendedInvalidation)] : []),
+    ...(signal.riskAssessment
+      ? ['', `Risk score: ${signal.riskAssessment.riskScore}/100 (daily ${signal.riskAssessment.dailyR}R, weekly ${signal.riskAssessment.weeklyR}R, drawdown ${signal.riskAssessment.currentDrawdownR}R)`]
+      : []),
     '',
     '_Analysis only - not financial advice. No auto-trading._',
   ];
@@ -61,7 +119,7 @@ function formatSignalMessage(signal) {
 }
 
 function formatStatsMessage(stats) {
-  return [
+  const lines = [
     '*Overall Statistics*',
     `Total Signals: ${stats.totalSignals}`,
     `Wins: ${stats.wins}`,
@@ -73,7 +131,22 @@ function formatStatsMessage(stats) {
     `Max Win Streak: ${stats.maxWinStreak}`,
     `Max Loss Streak: ${stats.maxLossStreak}`,
     `Current Streak: ${stats.currentStreak.type || '-'} x${stats.currentStreak.count}`,
-  ].join('\n');
+  ];
+  if (stats.advanced && stats.totalSignals >= 10) {
+    const a = stats.advanced;
+    lines.push(
+      '',
+      '*Advanced Metrics (per-trade, not annualized)*',
+      `Sharpe (per-trade): ${a.sharpePerTrade ?? '-'}`,
+      `Sortino (per-trade): ${a.sortinoPerTrade ?? '-'}`,
+      `Calmar (total R / max DD): ${a.calmarR ?? '-'}`,
+      `Recovery Factor: ${a.recoveryFactor ?? '-'}`,
+      `Expectancy: ${a.expectancyR ?? '-'}R per trade`
+    );
+  } else if (stats.totalSignals > 0) {
+    lines.push('', '(Advanced metrics show once you have 10+ closed signals - too few samples to be meaningful yet.)');
+  }
+  return lines.join('\n');
 }
 
 function formatSignalJourney(s) {
@@ -125,6 +198,7 @@ function buildReasonBullets(s) {
     orderbook: 'Order book pressure',
     openInterest: 'Open interest',
     funding: 'Funding rate',
+    smc: 'Smart Money Concepts',
   }[cat] || cat);
 
   if (s.result === 'WIN') {
@@ -137,4 +211,102 @@ function buildReasonBullets(s) {
   return bullets;
 }
 
-module.exports = { formatSignalMessage, formatStatsMessage, formatSignalJourney, fmtNum };
+function formatBinarySignalMessage(signal) {
+  const lines = [
+    `*${signal.symbol} - Binary/Time-based Signal*`,
+    '',
+    `Entry Price: ${fmtNum(signal.entryPrice)}`,
+    `Duration: ${signal.durationMinutes} minute(s)`,
+    `Predicted at expiry: price will be *${signal.direction}* entry`,
+    `Confidence: ${signal.confidence}%${signal.highTrust ? ' 🔥 HIGH-TRUST SETUP' : ''}`,
+    '',
+    'Chances at each checkpoint (from measured recent volatility + drift):',
+    ...signal.checkpoints.map((cp) => `- ${cp.label}: ${cp.direction} with ${cp.probabilityPct}% chance`),
+    '',
+    '_Estimate on the real market feed (Twelve Data), not Quotex\'s own OTC price -',
+    'see README for why those can differ. Analysis only, not financial advice._',
+  ];
+  return lines.join('\n');
+}
+
+function formatBinaryStatsMessage(stats) {
+  const lines = [
+    '*Binary Signal Accuracy (tracked separately from crypto signals)*',
+    `Total Signals: ${stats.totalSignals}`,
+    `Wins: ${stats.wins}`,
+    `Losses: ${stats.losses}`,
+    `Win Rate: ${stats.winRate}%`,
+  ];
+  if (stats.checkpointAccuracy?.length) {
+    lines.push('', 'Accuracy by checkpoint (all durations combined):');
+    stats.checkpointAccuracy.forEach((c) => {
+      lines.push(`- ${c.label}: ${c.accuracyPct}% (n=${c.total})`);
+    });
+  }
+  return lines.join('\n');
+}
+
+function formatBinarySignalJourney(s) {
+  const lines = [
+    `*${s.symbol} - predicted ${s.direction}*`,
+    `Entry: ${fmtNum(s.entryPrice)}`,
+    `Close (${s.durationMinutes}min later): ${fmtNum(s.closePrice)}`,
+    `Result: ${s.result}`,
+  ];
+  if (s.nearMissNote) lines.push('', s.nearMissNote);
+  return lines.join('\n');
+}
+
+function formatPerformanceMessage(risk, portfolio) {
+  const lines = [
+    '*Risk Dashboard (institutional risk engine)*',
+    '',
+    `Status: ${risk.allowed ? 'Trading allowed' : 'TRADING PAUSED'}`,
+    `Risk Score: ${risk.riskScore}/100`,
+    '',
+    `Today's R: ${risk.dailyR}R`,
+    `This week's R: ${risk.weeklyR}R`,
+    `Current Drawdown: ${risk.currentDrawdownR}R`,
+    `Consecutive Losses: ${risk.consecutiveLosses}`,
+    ...(risk.reasons.length ? ['', 'Active protections:', ...risk.reasons.map((r) => `- ${r}`)] : []),
+  ];
+
+  if (portfolio) {
+    lines.push('', '*Portfolio Risk*', `Open Positions: ${portfolio.openPositions} (${portfolio.uniquePairs.join(', ') || 'none'})`);
+    if (portfolio.concentrationWarning) lines.push(`⚠️ ${portfolio.concentrationWarning}`);
+    if (portfolio.correlationRisk?.flagged) {
+      lines.push('⚠️ High correlation between open positions:');
+      portfolio.correlationRisk.highCorrelationPairs.forEach((p) =>
+        lines.push(`- ${p.pairA} <-> ${p.pairB}: ${p.correlation} correlation`)
+      );
+    }
+  }
+
+  return lines.join('\n');
+}
+
+function formatReviewMessage(pair, signals) {
+  if (!signals.length) return `No signals found yet for ${pair}.`;
+  const lines = [`*Signal history for ${pair}*`, ''];
+  signals.forEach((s) => {
+    lines.push(
+      `${new Date(s.signalTime).toISOString().slice(0, 16).replace('T', ' ')} - ${s.direction}` +
+      (s.grade ? ` (${s.grade})` : '') +
+      (s.status === 'CLOSED' ? ` - ${s.result}` : ` - ${s.status}`)
+    );
+  });
+  return lines.join('\n');
+}
+
+module.exports = {
+  formatSignalMessage,
+  formatStatsMessage,
+  formatSignalJourney,
+  formatExtendedInvalidation,
+  formatBinarySignalMessage,
+  formatBinaryStatsMessage,
+  formatBinarySignalJourney,
+  formatPerformanceMessage,
+  formatReviewMessage,
+  fmtNum,
+};
