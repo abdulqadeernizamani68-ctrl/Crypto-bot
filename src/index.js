@@ -7,7 +7,15 @@ const config = require('./config');
 const logger = require('./utils/logger');
 const { handleSignalCommand } = require('./commands/signal');
 const { handleAccuracyCommand } = require('./commands/accuracy');
+const { handleBinaryCommand } = require('./commands/binary');
+const { handleBinaryAccuracyCommand } = require('./commands/binaryAccuracy');
+const { handleWhyCommand } = require('./commands/why');
+const { handlePerformanceCommand } = require('./commands/performance');
+const { handleReviewCommand } = require('./commands/review');
+const { handleHealthCommand } = require('./commands/health');
 const { runTrackerCycle } = require('./services/tracker');
+const { runPostmortemCycle } = require('./services/postmortemTracker');
+const { runBinaryTrackerCycle } = require('./services/binaryTracker');
 
 let clientInstance = null;
 
@@ -17,8 +25,29 @@ async function routeCommand(text) {
     const arg = trimmed.replace(/^!signal\s*/i, '');
     return handleSignalCommand(arg);
   }
+  if (/^!why\b/i.test(trimmed)) {
+    const arg = trimmed.replace(/^!why\s*/i, '');
+    return handleWhyCommand(arg);
+  }
+  if (/^!review\b/i.test(trimmed)) {
+    const arg = trimmed.replace(/^!review\s*/i, '');
+    return handleReviewCommand(arg);
+  }
+  if (/^!performance\b/i.test(trimmed)) {
+    return handlePerformanceCommand();
+  }
+  if (/^!health\b/i.test(trimmed)) {
+    return handleHealthCommand();
+  }
   if (/^!accuracy\b/i.test(trimmed)) {
     return handleAccuracyCommand();
+  }
+  if (/^!binaryaccuracy\b/i.test(trimmed)) {
+    return handleBinaryAccuracyCommand();
+  }
+  if (/^!binary\b/i.test(trimmed)) {
+    const arg = trimmed.replace(/^!binary\s*/i, '');
+    return handleBinaryCommand(arg);
   }
   return null;
 }
@@ -74,6 +103,19 @@ function startTrackerCron() {
     runTrackerCycle().catch((err) => logger.error('Tracker cycle failed:', err.message));
   });
   logger.info('Signal tracker cron scheduled (every 2 minutes).');
+
+  // Checkpoints here are hours/days/weeks apart, so this doesn't need to be
+  // frequent - every 30 minutes is plenty and keeps Binance/API usage low.
+  cron.schedule('*/30 * * * *', () => {
+    runPostmortemCycle().catch((err) => logger.error('Postmortem cycle failed:', err.message));
+  });
+  logger.info('Extended-invalidation postmortem cron scheduled (every 30 minutes).');
+
+  // Binary trades expire in minutes, so this needs to be tight.
+  cron.schedule('*/1 * * * *', () => {
+    runBinaryTrackerCycle().catch((err) => logger.error('Binary tracker cycle failed:', err.message));
+  });
+  logger.info('Binary signal tracker cron scheduled (every 1 minute).');
 }
 
 async function main() {
