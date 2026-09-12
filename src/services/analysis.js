@@ -1,6 +1,7 @@
 const indicators = require('./indicators');
 const structureSvc = require('./structure');
 const trapSvc = require('./trapDetection');
+const smcSvc = require('./smc');
 
 function clamp(v, min = -1, max = 1) {
   return Math.max(min, Math.min(max, v));
@@ -204,6 +205,12 @@ function scoreTrapRisk(candles1h, breakoutRetestDetail, orderBook) {
   return { score: clamp(result.score), findings: result.findings };
 }
 
+// ---- 14. Smart Money Concepts (BOS/CHoCH, liquidity sweeps, equal highs/
+// lows, FVG, order blocks, premium/discount) - pure candle-data analysis. ----
+function scoreSMC(candles1h) {
+  return smcSvc.scoreSMC(candles1h);
+}
+
 module.exports = {
   scoreTrend,
   scoreMomentum,
@@ -216,4 +223,5 @@ module.exports = {
   scoreOpenInterest,
   scoreFunding,
   scoreTrapRisk,
+  scoreSMC,
 };
