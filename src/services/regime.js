@@ -1,4 +1,4 @@
-const { ADX, ATR } = require('technicalindicators');
+const { ADX, ATR, EMA } = require('technicalindicators');
 
 // Determines the current market regime purely from the candle data supplied -
 // no hardcoded coin/date assumptions. Regime is recomputed on every request.
@@ -17,6 +17,16 @@ function detectRegime(candles1h) {
   const lastADX = adxSeries[adxSeries.length - 1].adx;
   const trend = lastADX >= 25 ? 'TRENDING' : 'RANGING';
 
+  // Directional label (Bull/Bear/Sideways) - additive, doesn't change any
+  // existing weight logic that keys off `trend` (TRENDING/RANGING).
+  const ema50Series = EMA.calculate({ period: 50, values: close });
+  const lastClose = close[close.length - 1];
+  const lastEma50 = ema50Series.length ? ema50Series[ema50Series.length - 1] : null;
+  let directionalTrend = 'SIDEWAYS';
+  if (trend === 'TRENDING' && lastEma50 != null) {
+    directionalTrend = lastClose > lastEma50 ? 'BULL_TREND' : 'BEAR_TREND';
+  }
+
   // ATR percentile relative to its own recent history (adaptive, not a fixed
   // absolute threshold, so it works across coins with very different prices).
   const atrValues = atrSeries.map((a) => a);
@@ -26,7 +36,7 @@ function detectRegime(candles1h) {
   const atrPercentile = rank / sorted.length;
   const volatility = atrPercentile >= 0.7 ? 'HIGH_VOLATILITY' : atrPercentile <= 0.3 ? 'LOW_VOLATILITY' : 'NORMAL_VOLATILITY';
 
-  return { trend, volatility, adx: lastADX, atrPercentile };
+  return { trend, directionalTrend, volatility, adx: lastADX, atrPercentile };
 }
 
 // Regime-specific category weight multipliers. These bias the scoring engine
