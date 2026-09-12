@@ -6,12 +6,17 @@ const regimeSvc = require('./regime');
 const scoringSvc = require('./scoring');
 const store = require('./redisStore');
 const newsFilter = require('./newsFilter');
+const invalidationAnalysis = require('./invalidationAnalysis');
+const evEngine = require('./expectedValue');
+const gradingSvc = require('./grading');
+const riskEngine = require('./riskEngine');
+const marketAnomaly = require('./marketAnomaly');
 const logger = require('../utils/logger');
 
 const CATEGORIES = [
   'trend', 'momentum', 'volatility', 'volume', 'structure',
   'supportResistance', 'breakoutRetest', 'liquidity', 'orderbook',
-  'openInterest', 'funding', 'trapRisk',
+  'openInterest', 'funding', 'trapRisk', 'smc',
 ];
 
 const CATEGORY_LABELS = {
@@ -27,6 +32,7 @@ const CATEGORY_LABELS = {
   openInterest: 'Open interest',
   funding: 'Funding rate',
   trapRisk: 'Trap/manipulation risk',
+  smc: 'Smart Money Concepts',
 };
 
 async function fetchAllData(pair) {
@@ -98,6 +104,9 @@ function dataUnavailableSignal(pair, problems) {
     topReasons: ['NO TRADE - DATA UNAVAILABLE', ...problems],
     topConfirmations: [],
     topInvalidationFactors: problems,
+    expectedValue: null,
+    grade: 'D',
+    riskAssessment: null,
     marketConditions: null,
     trapWarnings: [],
     status: 'NO_TRADE',
@@ -187,14 +196,45 @@ function buildExplanation({ combined, direction, trapFindings, marketConditions,
     topReasons: topReasons.slice(0, 5),
     topConfirmations: confirmations,
     topInvalidationFactors: invalidations.slice(0, 5),
+    featureImportance: computeFeatureImportance(combined.breakdown),
   };
+}
+
+// ---- Requirement 14: Feature Importance ----
+// Ranks every category by the actual magnitude of its weighted contribution
+// to the final score - this is exact and transparent (the scoring engine IS
+// a weighted sum, see scoring.js), not an approximation of a black-box
+// model the way SHAP values would be for a real ML model.
+function computeFeatureImportance(breakdown) {
+  const entries = Object.entries(breakdown || {}).map(([cat, v]) => {
+    const contribution = v.score * (v.regimeWeight ?? 1);
+    return { category: CATEGORY_LABELS[cat] || cat, score: v.score, contribution: Number(contribution.toFixed(3)) };
+  });
+  const totalMagnitude = entries.reduce((a, e) => a + Math.abs(e.contribution), 0) || 1;
+  return entries
+    .map((e) => ({ ...e, importancePct: Number(((Math.abs(e.contribution) / totalMagnitude) * 100).toFixed(1)) }))
+    .sort((a, b) => b.importancePct - a.importancePct);
 }
 
 // ---- Direction & risk decision, isolated from data-fetch/scoring so the
 // control flow above stays flat and readable instead of nested if/else. ----
-async function decideDirection({ pair, combined, marketConditions, currentPrice, atr15m, supportResistance }) {
+async function decideDirection({ pair, combined, marketConditions, currentPrice, atr15m, supportResistance, riskAssessment, anomalies }) {
   const reason = [];
   let effectiveConfidence = combined.confidence;
+
+  // ---- Institutional Risk Engine: overrides everything else. ----
+  if (!riskAssessment.allowed) {
+    reason.push('NO TRADE - risk protection active', ...riskAssessment.reasons);
+    return { direction: 'NO TRADE', effectiveConfidence, reason, entrySlTp: null, ev: null, grade: 'D' };
+  }
+
+  // ---- Market Anomaly Detection: an EXTREME flag (flash move, extreme
+  // volatility percentile) blocks new trades until conditions normalize. ----
+  const extremeAnomaly = anomalies.flags.find((f) => f.severity === 'EXTREME');
+  if (extremeAnomaly) {
+    reason.push(`NO TRADE - market anomaly detected: ${extremeAnomaly.note}`);
+    return { direction: 'NO TRADE', effectiveConfidence, reason, entrySlTp: null, ev: null, grade: 'D' };
+  }
 
   // ---- Requirement 1: News & Event Filter ----
   if (marketConditions.forceNoTrade) {
@@ -203,7 +243,7 @@ async function decideDirection({ pair, combined, marketConditions, currentPrice,
       marketConditions.newsHits.length ? 'major news event' : null,
     ].filter(Boolean).join(', ') || 'severe conditions';
     reason.push(`NO TRADE - abnormal market conditions detected (${causes})`);
-    return { direction: 'NO TRADE', effectiveConfidence, reason, entrySlTp: null };
+    return { direction: 'NO TRADE', effectiveConfidence, reason, entrySlTp: null, ev: null, grade: 'D' };
   }
 
   if (marketConditions.abnormal && marketConditions.confidencePenaltyPct > 0) {
@@ -219,7 +259,7 @@ async function decideDirection({ pair, combined, marketConditions, currentPrice,
     if (!meetsConfidence) reason.push(`Confidence ${effectiveConfidence}% below required ${config.engine.minConfidence}%`);
     if (!meetsAlignment) reason.push(`Only ${combined.alignedCategories}/${combined.totalCategories} categories aligned (need ${config.engine.minAlignedCategories})`);
     if (!hasDirection) reason.push('No clear directional consensus across analyses');
-    return { direction: 'NO TRADE', effectiveConfidence, reason, entrySlTp: null };
+    return { direction: 'NO TRADE', effectiveConfidence, reason, entrySlTp: null, ev: null, grade: 'D' };
   }
 
   // ---- Requirement 2: Duplicate Signal Protection ----
@@ -229,19 +269,41 @@ async function decideDirection({ pair, combined, marketConditions, currentPrice,
       `Duplicate signal protection: an active ${combined.direction} signal for ${pair} ` +
       `is already open (id ${activeDuplicate.id}) - waiting for it to complete, expire, or invalidate`
     );
-    return { direction: 'NO TRADE', effectiveConfidence, reason, entrySlTp: null };
+    return { direction: 'NO TRADE', effectiveConfidence, reason, entrySlTp: null, ev: null, grade: 'D' };
   }
 
   const entrySlTp = computeEntrySlTp(combined.direction, currentPrice, atr15m, supportResistance, config.engine.minRiskReward);
   if (entrySlTp.riskReward < config.engine.minRiskReward) {
     reason.push('Risk:Reward below minimum threshold after applying structure-based targets');
-    return { direction: 'NO TRADE', effectiveConfidence, reason, entrySlTp: null };
+    return { direction: 'NO TRADE', effectiveConfidence, reason, entrySlTp: null, ev: null, grade: 'D' };
   }
 
-  return { direction: combined.direction, effectiveConfidence, reason, entrySlTp };
+  // ---- Expected Value Engine: reject negative-EV setups even if confidence
+  // and alignment both passed - a high win-rate at a bad RR (or vice versa)
+  // can still be a losing bet over time. ----
+  const ev = evEngine.computeExpectedValue(effectiveConfidence, entrySlTp.riskReward);
+  if (!ev.positive) {
+    reason.push(`Negative expected value (${ev.expectedValueR}R) - setup rejected despite passing confidence/alignment`);
+    return { direction: 'NO TRADE', effectiveConfidence, reason, entrySlTp: null, ev, grade: 'D' };
+  }
+
+  // ---- Signal Quality Grading: only configured grades (default A+, A) are
+  // allowed to actually fire; everything else becomes NO TRADE. ----
+  const grade = gradingSvc.gradeSignal({
+    confidence: effectiveConfidence,
+    expectedValueR: ev.expectedValueR,
+    alignedCategories: combined.alignedCategories,
+    totalCategories: combined.totalCategories,
+  });
+  if (!config.engine.allowedGrades.includes(grade)) {
+    reason.push(`Setup graded ${grade} - below minimum required grade (${config.engine.allowedGrades.join('/')})`);
+    return { direction: 'NO TRADE', effectiveConfidence, reason, entrySlTp: null, ev, grade };
+  }
+
+  return { direction: combined.direction, effectiveConfidence, reason, entrySlTp, ev, grade };
 }
 
-async function generateSignal(pair) {
+async function generateSignal(pair, { persist = true } = {}) {
   const data = await fetchAllData(pair);
 
   const dataProblems = validateCoreData(data);
@@ -267,6 +329,7 @@ async function generateSignal(pair) {
   const openInterest = analysis.scoreOpenInterest(data.openInterest, trend.score);
   const funding = analysis.scoreFunding(data.funding);
   const trapRisk = analysis.scoreTrapRisk(timeframeCandles['1h'], breakoutRetest.detail, data.orderBook);
+  const smc = analysis.scoreSMC(timeframeCandles['1h']);
 
   const categoryScores = {
     trend: { score: trend.score },
@@ -281,6 +344,7 @@ async function generateSignal(pair) {
     openInterest: { score: openInterest.score },
     funding: { score: funding.score },
     trapRisk: { score: trapRisk.score },
+    smc: { score: smc.score },
   };
 
   const combined = scoringSvc.combineScores(
@@ -300,12 +364,19 @@ async function generateSignal(pair) {
     pair,
   });
 
-  const { direction, effectiveConfidence, reason, entrySlTp } = await decideDirection({
-    pair, combined, marketConditions, currentPrice, atr15m, supportResistance,
+  // ---- Institutional Risk Engine input: real closed-signal history ----
+  const allSignalsForRisk = await store.getAllSignals();
+  const riskAssessment = riskEngine.assessRisk(allSignalsForRisk);
+
+  // ---- Market Anomaly Detection ----
+  const anomalies = marketAnomaly.detectAnomalies({ candles15m: timeframeCandles['15m'], atrValue: atr15m, regime });
+
+  const { direction, effectiveConfidence, reason, entrySlTp, ev, grade } = await decideDirection({
+    pair, combined, marketConditions, currentPrice, atr15m, supportResistance, riskAssessment, anomalies,
   });
 
   const explanation = buildExplanation({
-    combined, direction, trapFindings: trapRisk.findings, marketConditions, baseReasons: reason,
+    combined, direction, trapFindings: [...trapRisk.findings, ...smc.findings], marketConditions, baseReasons: reason,
   });
 
   const signal = {
@@ -319,6 +390,9 @@ async function generateSignal(pair) {
     confidence: effectiveConfidence,
     liveConfidence: combined.liveConfidence,
     calibrationFactor: combined.calibrationFactor,
+    expectedValue: ev,
+    grade,
+    riskAssessment,
     signalTime: Date.now(),
     validityMinutes: validityMinutes(regime),
     regime,
@@ -327,6 +401,8 @@ async function generateSignal(pair) {
     topReasons: explanation.topReasons,
     topConfirmations: explanation.topConfirmations,
     topInvalidationFactors: explanation.topInvalidationFactors,
+    featureImportance: explanation.featureImportance,
+    smc: { bosChoch: smc.bosChoch, premiumDiscount: smc.premiumDiscount },
     marketConditions: {
       abnormal: marketConditions.abnormal,
       severity: marketConditions.severity,
@@ -334,6 +410,7 @@ async function generateSignal(pair) {
       newsHits: marketConditions.newsHits,
     },
     trapWarnings: trapRisk.findings,
+    anomalies: anomalies.flags,
     paper: config.engine.paperMode,
     // tracking fields, filled in by the tracker job later
     status: direction === 'NO TRADE' ? 'NO_TRADE' : 'OPEN',
@@ -345,7 +422,23 @@ async function generateSignal(pair) {
   };
 
   if (direction !== 'NO TRADE') {
-    await store.saveNewSignal(signal);
+    // Extended structural invalidation level + whatever real recovery-odds
+    // history has accumulated so far for this pair+direction (see
+    // invalidationAnalysis.js - reads only, never guesses a number).
+    signal.extendedInvalidation = await invalidationAnalysis.buildExtendedInvalidation({
+      direction,
+      entry: currentPrice,
+      stopLoss: signal.stopLoss,
+      candles4h: timeframeCandles['4h'],
+      pair,
+    }).catch((err) => {
+      logger.warn(`extendedInvalidation failed for ${pair}: ${err.message}`);
+      return null;
+    });
+
+    if (persist) {
+      await store.saveNewSignal(signal);
+    }
   }
 
   return signal;
