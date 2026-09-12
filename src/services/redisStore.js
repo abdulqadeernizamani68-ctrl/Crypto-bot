@@ -11,6 +11,11 @@ const KEYS = {
   allSignalsZset: 'signals:all', // sorted set, score = signalTime (ms)
   openSignalsSet: 'signals:open',
   filterPerf: (category) => `filterperf:${category}`,
+  // Extended-invalidation ("structural SL") post-mortem tracking.
+  postmortem: (id) => `postmortem:${id}`,
+  postmortemPendingSet: 'postmortem:pending',
+  invalidationStats: (pair, direction, checkpointLabel) =>
+    `invalidation:${pair}:${direction}:${checkpointLabel}`,
 };
 
 function newSignalId(pair) {
@@ -119,6 +124,54 @@ async function getAllFilterPerformance(categories) {
   return Object.fromEntries(entries);
 }
 
+// ---- Extended invalidation ("structural SL") post-mortem tracking ----
+// Created whenever a signal closes via SL_HIT with a structural extended
+// level attached. Tracks, per fixed checkpoint, whether price came back to
+// the reference (pre-SL) price - purely observational, never influences a
+// live signal's direction, only builds up real historical odds over time.
+async function createPostmortem(record) {
+  await redis.set(KEYS.postmortem(record.id), JSON.stringify(record));
+  await redis.sadd(KEYS.postmortemPendingSet, record.id);
+  return record;
+}
+
+async function getPostmortem(id) {
+  const raw = await redis.get(KEYS.postmortem(id));
+  if (!raw) return null;
+  return typeof raw === 'string' ? JSON.parse(raw) : raw;
+}
+
+async function updatePostmortem(id, patch) {
+  const existing = await getPostmortem(id);
+  if (!existing) return null;
+  const updated = { ...existing, ...patch };
+  await redis.set(KEYS.postmortem(id), JSON.stringify(updated));
+  return updated;
+}
+
+async function removePostmortemFromPending(id) {
+  await redis.srem(KEYS.postmortemPendingSet, id);
+}
+
+async function getPendingPostmortemIds() {
+  return redis.smembers(KEYS.postmortemPendingSet);
+}
+
+async function recordInvalidationCheckpoint(pair, direction, checkpointLabel, recovered) {
+  const key = KEYS.invalidationStats(pair, direction, checkpointLabel);
+  const raw = await redis.get(key);
+  const stats = raw ? (typeof raw === 'string' ? JSON.parse(raw) : raw) : { recovered: 0, total: 0 };
+  stats.total += 1;
+  if (recovered) stats.recovered += 1;
+  await redis.set(key, JSON.stringify(stats));
+  return stats;
+}
+
+async function getInvalidationStats(pair, direction, checkpointLabel) {
+  const raw = await redis.get(KEYS.invalidationStats(pair, direction, checkpointLabel));
+  return raw ? (typeof raw === 'string' ? JSON.parse(raw) : raw) : { recovered: 0, total: 0 };
+}
+
 module.exports = {
   redis,
   newSignalId,
@@ -134,4 +187,11 @@ module.exports = {
   recordFilterOutcome,
   getFilterPerformance,
   getAllFilterPerformance,
+  createPostmortem,
+  getPostmortem,
+  updatePostmortem,
+  removePostmortemFromPending,
+  getPendingPostmortemIds,
+  recordInvalidationCheckpoint,
+  getInvalidationStats,
 };
