@@ -98,6 +98,22 @@ async function checkOpenSignal(signal) {
         closedAt: now,
       });
       await recordAdaptiveLearning(closed, won);
+
+      // If this was a structural SL hit and an extended invalidation level
+      // was computed at signal time, start tracking real recovery odds for
+      // it (see postmortemTracker.js for the checkpoint checks themselves).
+      if (hitResult === 'SL_HIT' && signal.extendedInvalidation) {
+        await store.createPostmortem({
+          id: signal.id,
+          pair: signal.pair,
+          direction: signal.direction,
+          referencePrice: signal.entry,
+          extendedLevel: signal.extendedInvalidation.level,
+          slHitTime: now,
+          checkpointsChecked: {},
+        });
+      }
+
       logger.info(`Signal ${signal.id} closed: ${hitResult}`);
       return;
     }
