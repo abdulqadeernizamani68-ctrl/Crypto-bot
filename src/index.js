@@ -16,6 +16,7 @@ const { handleHealthCommand } = require('./commands/health');
 const { runTrackerCycle } = require('./services/tracker');
 const { runPostmortemCycle } = require('./services/postmortemTracker');
 const { runBinaryTrackerCycle } = require('./services/binaryTracker');
+const { runScanCycle } = require('./services/scanner');
 
 let clientInstance = null;
 
@@ -98,7 +99,7 @@ function startHealthServer() {
   });
 }
 
-function startTrackerCron() {
+function startTrackerCron(discordClient) {
   cron.schedule('*/2 * * * *', () => {
     runTrackerCycle().catch((err) => logger.error('Tracker cycle failed:', err.message));
   });
@@ -116,12 +117,22 @@ function startTrackerCron() {
     runBinaryTrackerCycle().catch((err) => logger.error('Binary tracker cycle failed:', err.message));
   });
   logger.info('Binary signal tracker cron scheduled (every 1 minute).');
+
+  if (config.scanner.enabled) {
+    const everyN = Math.max(1, Math.round(config.scanner.intervalMinutes));
+    cron.schedule(`*/${everyN} * * * *`, () => {
+      runScanCycle(discordClient).catch((err) => logger.error('Scanner cycle failed:', err.message));
+    });
+    logger.info(`Auto-scanner cron scheduled (every ${everyN} minutes, watching ${config.scanner.pairs.length} pairs).`);
+  } else {
+    logger.info('Auto-scanner is disabled (set SCANNER_ENABLED=true and SCANNER_CHANNEL_ID to turn it on).');
+  }
 }
 
 async function main() {
   startHealthServer();
-  startDiscordBot();
-  startTrackerCron();
+  const client = startDiscordBot();
+  startTrackerCron(client);
 }
 
 main().catch((err) => {
