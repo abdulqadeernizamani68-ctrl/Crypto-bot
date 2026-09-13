@@ -18,17 +18,31 @@
 
 function combineScores(categoryScores, regimeWeights, adaptiveWeights, minSamples) {
   let weightedSum = 0;
-  let weightTotal = 0;
+  let weightTotal = 0; // magnitude denominator - ACTIVE categories only, see note below
   let alignedBullish = 0;
   let alignedBearish = 0;
   const breakdown = {};
+
+  // A category sitting within +/-0.05 of zero is SILENT (nothing detected -
+  // e.g. no funding extreme, no SMC pattern, no OI shift right now), not a
+  // weak vote against the trade. Letting silent categories dilute the
+  // magnitude average meant a genuinely strong trend/momentum/structure
+  // read could still never push confidence very high just because
+  // naturally-quiet categories (funding, OI, liquidity, SMC) had nothing to
+  // say at that moment. Magnitude now reflects the strength of whatever IS
+  // actively speaking; the agreement component below still requires broad
+  // participation across the full category count, so this doesn't let a
+  // signal from 2-3 categories alone fake high confidence.
+  const ACTIVE_THRESHOLD = 0.05;
 
   for (const [category, data] of Object.entries(categoryScores)) {
     if (data.score === null || data.score === undefined) continue;
 
     const regimeW = regimeWeights[category] ?? 1.0;
-    weightedSum += data.score * regimeW;
-    weightTotal += regimeW;
+    if (Math.abs(data.score) > ACTIVE_THRESHOLD) {
+      weightedSum += data.score * regimeW;
+      weightTotal += regimeW;
+    }
 
     const adaptive = adaptiveWeights[category];
     const adaptiveTrusted = !!(adaptive && adaptive.samples >= minSamples);
