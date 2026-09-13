@@ -26,33 +26,18 @@ discord: {
     minAlignedCategories: num(process.env.MIN_ALIGNED_CATEGORIES, 4),
     minRiskReward: num(process.env.MIN_RISK_REWARD, 1.5),
     adaptiveMinSamples: num(process.env.ADAPTIVE_MIN_SAMPLES, 20),
-    // Only these grades are allowed to actually fire as BUY/SELL by default -
-    // everything else becomes NO TRADE with the grade shown as the reason.
     allowedGrades: (process.env.ALLOWED_GRADES || 'A+,A').split(',').map((g) => g.trim()),
-    // When true, signals are still computed and logged/tracked but are
-    // clearly labelled as PAPER and should not be treated as live calls.
-    // Use this to validate any new logic/weight change before flipping it
-    // on for real, per the "no direct-to-production" requirement.
     paperMode: (process.env.PAPER_MODE || 'false') === 'true',
   },
   news: {
     enabled: (process.env.NEWS_FILTER_ENABLED || 'true') === 'true',
-    // Optional - if unset, the bot still runs abnormal-condition detection
-    // from live price action alone (see services/newsFilter.js).
     cryptoPanicToken: process.env.CRYPTOPANIC_API_KEY || '',
     highImpactWindowMinutes: num(process.env.NEWS_HIGH_IMPACT_WINDOW_MIN, 30),
-    // ATR percentile (0-1, relative to the pair's own recent history) above
-    // which volatility is considered abnormal/extreme rather than merely high.
     extremeAtrPercentile: num(process.env.EXTREME_ATR_PERCENTILE, 0.95),
   },
   timeframes: ['1m', '5m', '15m', '1h', '4h'],
 
-  // ---- Extended (structural) invalidation tracking ----
   invalidation: {
-    // Time horizons checked after a structural SL is hit, to see whether
-    // price recovers back to the pre-SL reference price. Purely measurement
-    // points - the percentages themselves are always computed live from
-    // Redis history, never hardcoded.
     checkpoints: [
       { label: '6 ghante', minutes: 6 * 60 },
       { label: '1 din', minutes: 24 * 60 },
@@ -65,31 +50,21 @@ discord: {
     minSamples: num(process.env.INVALIDATION_MIN_SAMPLES, 12),
   },
 
-  // ---- Twelve Data (used for binary-option style signals; Binance has no
-  // forex/OTC data, and Quotex's own OTC feed isn't publicly accessible at
-  // all - see binaryEngine.js header for the full honesty note). ----
   twelvedata: {
     apiKey: process.env.TWELVEDATA_API_KEY || '',
     baseUrl: 'https://api.twelvedata.com',
   },
 
   binary: {
-    // Fixed checkpoint fractions of the chosen duration - e.g. a 20-minute
-    // trade gets checked at 5, 10, 15 and 20 minutes in.
     checkpointFractions: [0.25, 0.5, 0.75, 1.0],
     minDurationMinutes: num(process.env.BINARY_MIN_DURATION_MIN, 1),
     maxDurationMinutes: num(process.env.BINARY_MAX_DURATION_MIN, 60),
-    // Confidence at/above this is called out as a high-trust setup in the
-    // reply - it's just a label threshold, the confidence number itself is
-    // always computed fresh from live volatility + drift, never hardcoded.
     highTrustThreshold: num(process.env.BINARY_HIGH_TRUST_THRESHOLD, 90),
     lookbackMinutesForStats: num(process.env.BINARY_LOOKBACK_MIN, 120),
+    tiltMaxPct: num(process.env.BINARY_TILT_MAX_PCT, 8),
+    maxProbabilityPct: num(process.env.BINARY_MAX_PROBABILITY_PCT, 95),
   },
 
-  // ---- Institutional risk engine ----
-  // All limits are configurable ceilings; the actual daily/weekly R,
-  // drawdown, and streak numbers are always computed fresh from real closed
-  // signal history (riskEngine.js) - nothing here is a signal-level number.
   risk: {
     maxDailyLossR: num(process.env.MAX_DAILY_LOSS_R, 3),
     maxWeeklyLossR: num(process.env.MAX_WEEKLY_LOSS_R, 6),
