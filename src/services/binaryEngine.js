@@ -26,6 +26,18 @@
 // (uncertainty grows with sqrt(t)) and why a strong recent trend can look
 // confident on a 1-minute check but fade out on a 30-minute one - that's the
 // model being honest about compounding uncertainty, not a bug.
+//
+// ---- BUG FIX LOG ----
+// An earlier version injected the technical tilt directly into the drift
+// term, which made it scale with sqrt(duration) and produced ~95-100%
+// "confidence" on almost every pair regardless of real conditions - caught
+// because a user ran !binary on 20 pairs and every single one came back
+// 95%+, which is itself the tell that something was systematically wrong
+// rather than the market being unanimous. Tilt now only applies a small,
+// fixed-size percentage-point nudge directly to each checkpoint's
+// probability (config.binary.tiltMaxPct), and every probability is hard-
+// capped (config.binary.maxProbabilityPct, default 95%) regardless of what
+// the model computes - a safety net against this entire class of bug.
 
 const config = require('../config');
 const indicators = require('./indicators');
@@ -36,7 +48,7 @@ function normalCdf(x) {
   const d = 0.3989423 * Math.exp((-x * x) / 2);
   let prob = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
   if (x > 0) prob = 1 - prob;
-  return 1 - prob; // P(Z <= x)
+  return 1 - prob;
 }
 
 function logReturns(closes) {
@@ -55,7 +67,6 @@ function stdev(arr, m) {
 }
 
 function technicalTilt(candles) {
-  // Bounded to [-1, 1]. EMA9 vs EMA21 cross + RSI7 relative to 50.
   const ema9 = indicators.ema(candles, 9);
   const ema21 = indicators.ema(candles, 21);
   const rsi7 = indicators.rsi(candles, 7);
@@ -94,17 +105,20 @@ async function generateBinarySignal(symbolRaw, durationMinutes) {
   const volPerMin = stdev(rets, driftPerMin);
 
   const tilt = technicalTilt(candles);
-  // Tilt can shift drift by at most 1 stdev-per-minute worth - i.e. it can
-  // meaningfully lean the estimate but never override what volatility itself
-  // measured.
-  const adjustedDrift = driftPerMin + tilt * volPerMin;
 
   const checkpoints = config.binary.checkpointFractions.map((frac) => {
     const t = Math.max(1, Math.round(duration * frac));
-    const meanLogRet = adjustedDrift * t;
+    const meanLogRet = driftPerMin * t;
     const sdLogRet = volPerMin * Math.sqrt(t);
-    const z = sdLogRet > 0 ? meanLogRet / sdLogRet : (meanLogRet > 0 ? 5 : meanLogRet < 0 ? -5 : 0);
-    const probAbove = normalCdf(z);
+    const z = sdLogRet > 0 ? meanLogRet / sdLogRet : (meanLogRet > 0 ? 3 : meanLogRet < 0 ? -3 : 0);
+    const baseProbAbove = normalCdf(z);
+
+    const nudge = (tilt * config.binary.tiltMaxPct) / 100;
+    let probAbove = baseProbAbove + nudge;
+
+    const cap = config.binary.maxProbabilityPct / 100;
+    probAbove = Math.max(1 - cap, Math.min(cap, probAbove));
+
     const direction = probAbove >= 0.5 ? 'ABOVE' : 'BELOW';
     const probability = direction === 'ABOVE' ? probAbove : 1 - probAbove;
     return {
