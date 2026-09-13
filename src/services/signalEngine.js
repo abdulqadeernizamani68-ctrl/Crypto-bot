@@ -13,26 +13,23 @@ const riskEngine = require('./riskEngine');
 const marketAnomaly = require('./marketAnomaly');
 const logger = require('../utils/logger');
 
+// Trimmed from 13 categories to 6 - Volatility, Support/Resistance,
+// Breakout/Retest, Open Interest, Funding, Trap Risk, and SMC were removed
+// from voting because they are silent (score 0) on most candles, which
+// dragged the alignment ratio down and caused excessive NO TRADE. See note
+// below - Support/Resistance data is still computed for take-profit target
+// placement, just no longer counted as a directional vote.
 const CATEGORIES = [
-  'trend', 'momentum', 'volatility', 'volume', 'structure',
-  'supportResistance', 'breakoutRetest', 'liquidity', 'orderbook',
-  'openInterest', 'funding', 'trapRisk', 'smc',
+  'trend', 'momentum', 'volume', 'structure', 'liquidity', 'orderbook',
 ];
 
 const CATEGORY_LABELS = {
   trend: 'Trend alignment',
   momentum: 'Momentum',
-  volatility: 'Volatility conditions',
   volume: 'Volume',
   structure: 'Market structure',
-  supportResistance: 'Support/Resistance',
-  breakoutRetest: 'Breakout/Retest',
   liquidity: 'Liquidity',
   orderbook: 'Order book pressure',
-  openInterest: 'Open interest',
-  funding: 'Funding rate',
-  trapRisk: 'Trap/manipulation risk',
-  smc: 'Smart Money Concepts',
 };
 
 async function fetchAllData(pair) {
@@ -320,31 +317,20 @@ async function generateSignal(pair, { persist = true } = {}) {
 
   const trend = analysis.scoreTrend(timeframeCandles);
   const momentum = analysis.scoreMomentum(timeframeCandles);
-  const volatility = analysis.scoreVolatility(timeframeCandles['15m'], regime);
   const volume = analysis.scoreVolume(timeframeCandles['15m'], data.futures15m);
   const structure = analysis.scoreStructure(timeframeCandles['1h']);
+  // Still computed (not a category vote anymore) - its support/resistance
+  // levels are used below in computeEntrySlTp() to place a smarter take-profit.
   const supportResistance = analysis.scoreSupportResistance(timeframeCandles['1h'], currentPrice);
-  const breakoutRetest = analysis.scoreBreakoutRetest(timeframeCandles['1h']);
   const { liquidity, orderbook } = analysis.scoreLiquidityAndOrderBook(data.orderBook);
-  const openInterest = analysis.scoreOpenInterest(data.openInterest, trend.score);
-  const funding = analysis.scoreFunding(data.funding);
-  const trapRisk = analysis.scoreTrapRisk(timeframeCandles['1h'], breakoutRetest.detail, data.orderBook);
-  const smc = analysis.scoreSMC(timeframeCandles['1h']);
 
   const categoryScores = {
     trend: { score: trend.score },
     momentum: { score: momentum.score },
-    volatility: { score: volatility.score },
     volume: { score: volume.score },
     structure: { score: structure.score },
-    supportResistance: { score: supportResistance.score },
-    breakoutRetest: { score: breakoutRetest.score },
     liquidity: { score: liquidity.score },
     orderbook: { score: orderbook.score },
-    openInterest: { score: openInterest.score },
-    funding: { score: funding.score },
-    trapRisk: { score: trapRisk.score },
-    smc: { score: smc.score },
   };
 
   const combined = scoringSvc.combineScores(
@@ -376,7 +362,7 @@ async function generateSignal(pair, { persist = true } = {}) {
   });
 
   const explanation = buildExplanation({
-    combined, direction, trapFindings: [...trapRisk.findings, ...smc.findings], marketConditions, baseReasons: reason,
+    combined, direction, trapFindings: [], marketConditions, baseReasons: reason,
   });
 
   const signal = {
@@ -402,14 +388,13 @@ async function generateSignal(pair, { persist = true } = {}) {
     topConfirmations: explanation.topConfirmations,
     topInvalidationFactors: explanation.topInvalidationFactors,
     featureImportance: explanation.featureImportance,
-    smc: { bosChoch: smc.bosChoch, premiumDiscount: smc.premiumDiscount },
     marketConditions: {
       abnormal: marketConditions.abnormal,
       severity: marketConditions.severity,
       priceShock: marketConditions.priceShock,
       newsHits: marketConditions.newsHits,
     },
-    trapWarnings: trapRisk.findings,
+    trapWarnings: [],
     anomalies: anomalies.flags,
     paper: config.engine.paperMode,
     // tracking fields, filled in by the tracker job later
