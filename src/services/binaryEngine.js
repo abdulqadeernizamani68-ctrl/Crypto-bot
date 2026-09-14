@@ -26,35 +26,35 @@
 // (uncertainty grows with sqrt(t)) and why a strong recent trend can look
 // confident on a 1-minute check but fade out on a 30-minute one - that's the
 // model being honest about compounding uncertainty, not a bug.
-//
-// ---- BUG FIX LOG ----
-// An earlier version injected the technical tilt directly into the drift
-// term, which made it scale with sqrt(duration) and produced ~95-100%
-// "confidence" on almost every pair regardless of real conditions - caught
-// because a user ran !binary on 20 pairs and every single one came back
-// 95%+, which is itself the tell that something was systematically wrong
-// rather than the market being unanimous. Tilt now only applies a small,
-// fixed-size percentage-point nudge directly to each checkpoint's
-// probability (config.binary.tiltMaxPct), and every probability is hard-
-// capped (config.binary.maxProbabilityPct, default 95%) regardless of what
-// the model computes - a safety net against this entire class of bug.
 
 const config = require('../config');
 const indicators = require('./indicators');
 const twelvedata = require('./twelvedata');
+const logger = require('../utils/logger');
 
 function normalCdf(x) {
   const t = 1 / (1 + 0.2316419 * Math.abs(x));
   const d = 0.3989423 * Math.exp((-x * x) / 2);
   let prob = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
   if (x > 0) prob = 1 - prob;
-  return 1 - prob;
+  return 1 - prob; // P(Z <= x)
 }
 
 function logReturns(closes) {
   const out = [];
   for (let i = 1; i < closes.length; i++) out.push(Math.log(closes[i] / closes[i - 1]));
   return out;
+}
+
+// Readable label for a duration given in minutes (fractional minutes below
+// 1 are shown in seconds, whole hours+ shown in hours for long durations).
+function formatMinutes(mins) {
+  if (mins < 1) return `${Math.round(mins * 60)}s`;
+  if (mins >= 60) {
+    const hrs = mins / 60;
+    return `${Number.isInteger(hrs) ? hrs : hrs.toFixed(1)}h`;
+  }
+  return `${Math.round(mins)} min`;
 }
 
 function mean(arr) {
@@ -67,6 +67,7 @@ function stdev(arr, m) {
 }
 
 function technicalTilt(candles) {
+  // Bounded to [-1, 1]. EMA9 vs EMA21 cross + RSI7 relative to 50.
   const ema9 = indicators.ema(candles, 9);
   const ema21 = indicators.ema(candles, 21);
   const rsi7 = indicators.rsi(candles, 7);
@@ -89,41 +90,54 @@ async function generateBinarySignal(symbolRaw, durationMinutes) {
     Math.min(config.binary.maxDurationMinutes, durationMinutes)
   );
 
-  const candles = await twelvedata.getTimeSeries(
-    symbolRaw,
-    '1min',
-    Math.max(60, config.binary.lookbackMinutesForStats)
-  );
+  // Lookback scales with how far ahead we're forecasting (more history for
+  // a 48h trade than a 5-minute one), capped at 12h of 1-min candles to
+  // keep the API call and the stats window reasonable.
+  const statsLookback = Math.max(60, config.binary.lookbackMinutesForStats, Math.min(720, Math.ceil(duration * 1.5)));
+
+  const candles = await twelvedata.getTimeSeries(symbolRaw, '1min', statsLookback);
   if (candles.length < 30) {
     throw new Error(`Not enough recent 1-minute data for ${symbolRaw} to analyze (got ${candles.length} candles)`);
   }
 
   const closes = candles.map((c) => c.close);
-  const entryPrice = closes[closes.length - 1];
-  const rets = logReturns(closes.slice(-config.binary.lookbackMinutesForStats));
+  // Entry price: use the live quote (Twelve Data's /price endpoint) instead
+  // of the last completed 1-minute candle close, which can be up to ~60s
+  // stale. Falls back to the candle close if the live quote call fails for
+  // any reason (rate limit, symbol not supported on /price, etc).
+  let entryPrice = closes[closes.length - 1];
+  try {
+    const livePrice = await twelvedata.getCurrentPrice(symbolRaw);
+    if (Number.isFinite(livePrice) && livePrice > 0) entryPrice = livePrice;
+  } catch (err) {
+    logger.warn(`Live price fetch failed for ${symbolRaw}, using last candle close instead: ${err.message}`);
+  }
+  const rets = logReturns(closes.slice(-statsLookback));
   const driftPerMin = mean(rets);
   const volPerMin = stdev(rets, driftPerMin);
 
   const tilt = technicalTilt(candles);
+  // Tilt can shift drift by at most 1 stdev-per-minute worth - i.e. it can
+  // meaningfully lean the estimate but never override what volatility itself
+  // measured.
+  const adjustedDrift = driftPerMin + tilt * volPerMin;
 
   const checkpoints = config.binary.checkpointFractions.map((frac) => {
-    const t = Math.max(1, Math.round(duration * frac));
-    const meanLogRet = driftPerMin * t;
+    // Below 1 minute we keep a fractional t (in minutes) instead of forcing
+    // a whole-minute round-up - the math still works (sqrt-time scaling of
+    // 1-minute volatility), it's just extrapolating below the native
+    // resolution of the 1-minute candle data, so treat it as a rougher
+    // estimate than 1min+ durations.
+    const t = duration >= 1 ? Math.max(1, Math.round(duration * frac)) : Math.max(1 / 60, duration * frac);
+    const meanLogRet = adjustedDrift * t;
     const sdLogRet = volPerMin * Math.sqrt(t);
-    const z = sdLogRet > 0 ? meanLogRet / sdLogRet : (meanLogRet > 0 ? 3 : meanLogRet < 0 ? -3 : 0);
-    const baseProbAbove = normalCdf(z);
-
-    const nudge = (tilt * config.binary.tiltMaxPct) / 100;
-    let probAbove = baseProbAbove + nudge;
-
-    const cap = config.binary.maxProbabilityPct / 100;
-    probAbove = Math.max(1 - cap, Math.min(cap, probAbove));
-
+    const z = sdLogRet > 0 ? meanLogRet / sdLogRet : (meanLogRet > 0 ? 5 : meanLogRet < 0 ? -5 : 0);
+    const probAbove = normalCdf(z);
     const direction = probAbove >= 0.5 ? 'ABOVE' : 'BELOW';
     const probability = direction === 'ABOVE' ? probAbove : 1 - probAbove;
     return {
       fraction: frac,
-      label: frac === 1 ? 'Expiry' : `${Math.round(frac * 100)}% (${t} min)`,
+      label: frac === 1 ? 'Expiry' : `${Math.round(frac * 100)}% (${formatMinutes(t)})`,
       minutes: t,
       direction,
       probabilityPct: Number((probability * 100).toFixed(1)),
@@ -148,4 +162,4 @@ async function generateBinarySignal(symbolRaw, durationMinutes) {
   };
 }
 
-module.exports = { generateBinarySignal, normalCdf };
+module.exports = { generateBinarySignal, normalCdf, formatMinutes };
