@@ -1,148 +1,432 @@
-// ---- HONESTY NOTE (read before wiring this to real money) ----
-// Quotex's own OTC price feed is not publicly available anywhere - OTC pairs
-// (used on weekends and on many "() OTC" symbols) are a broker-generated
-// price, not a real market feed, so no external API (including Twelve Data)
-// can match it. This engine uses Twelve Data's REAL forex/crypto feed as the
-// closest available proxy, which is only meaningfully close to what Quotex
-// shows for *non-OTC* pairs during real market hours. Treat every output as
-// an estimate on the real underlying asset, not a guarantee of what Quotex's
-// OTC price will do. Fixed 1-5 minute expiries are close to a random walk -
-// no legitimate method reaches genuine, reliable 90%+ edge on those; when
-// this engine reports a high number, it means the *math it computed* came
-// out high, not that the trade is a sure thing.
-//
-// ---- HOW THE PROBABILITY IS ACTUALLY COMPUTED (no hardcoded odds) ----
-// 1. Pull recent 1-minute closes and compute the log-return mean (drift) and
-//    standard deviation (volatility) *per minute*, measured fresh every call
-//    from real recent price action (config.binary.lookbackMinutesForStats).
-// 2. Nudge that drift slightly using a short-term technical tilt (EMA9/EMA21
-//    cross + RSI7), bounded to a fraction of the *measured* volatility so it
-//    can't manufacture a signal out of nothing.
-// 3. Model the log-price at any future time t as approximately Normal with
-//    mean = drift*t and stdev = volatility*sqrt(t) (standard random-walk
-//    diffusion assumption). The probability that price finishes above entry
-//    is the Normal CDF of that distribution evaluated at 0.
-// This is why longer horizons naturally get less extreme probabilities
-// (uncertainty grows with sqrt(t)) and why a strong recent trend can look
-// confident on a 1-minute check but fade out on a 30-minute one - that's the
-// model being honest about compounding uncertainty, not a bug.
-
 const config = require('../config');
+const binance = require('./binance');
+const analysis = require('./analysis');
 const indicators = require('./indicators');
-const twelvedata = require('./twelvedata');
+const regimeSvc = require('./regime');
+const scoringSvc = require('./scoring');
+const store = require('./redisStore');
+const newsFilter = require('./newsFilter');
+const invalidationAnalysis = require('./invalidationAnalysis');
+const evEngine = require('./expectedValue');
+const gradingSvc = require('./grading');
+const riskEngine = require('./riskEngine');
+const marketAnomaly = require('./marketAnomaly');
 const logger = require('../utils/logger');
 
-function normalCdf(x) {
-  const t = 1 / (1 + 0.2316419 * Math.abs(x));
-  const d = 0.3989423 * Math.exp((-x * x) / 2);
-  let prob = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
-  if (x > 0) prob = 1 - prob;
-  return 1 - prob; // P(Z <= x)
-}
+// Trimmed from 13 categories to 6 - Volatility, Support/Resistance,
+// Breakout/Retest, Open Interest, Funding, Trap Risk, and SMC were removed
+// from voting because they are silent (score 0) on most candles, which
+// dragged the alignment ratio down and caused excessive NO TRADE. See note
+// below - Support/Resistance data is still computed for take-profit target
+// placement, just no longer counted as a directional vote.
+const CATEGORIES = [
+  'trend', 'momentum', 'volume', 'structure', 'liquidity', 'orderbook',
+];
 
-function logReturns(closes) {
-  const out = [];
-  for (let i = 1; i < closes.length; i++) out.push(Math.log(closes[i] / closes[i - 1]));
-  return out;
-}
+const CATEGORY_LABELS = {
+  trend: 'Trend alignment',
+  momentum: 'Momentum',
+  volume: 'Volume',
+  structure: 'Market structure',
+  liquidity: 'Liquidity',
+  orderbook: 'Order book pressure',
+};
 
-function mean(arr) {
-  return arr.reduce((a, b) => a + b, 0) / arr.length;
-}
-
-function stdev(arr, m) {
-  const variance = arr.reduce((a, b) => a + (b - m) ** 2, 0) / (arr.length - 1 || 1);
-  return Math.sqrt(variance);
-}
-
-function technicalTilt(candles) {
-  // Bounded to [-1, 1]. EMA9 vs EMA21 cross + RSI7 relative to 50.
-  const ema9 = indicators.ema(candles, 9);
-  const ema21 = indicators.ema(candles, 21);
-  const rsi7 = indicators.rsi(candles, 7);
-  let tilt = 0;
-  let parts = 0;
-  if (ema9 != null && ema21 != null) {
-    tilt += ema9 > ema21 ? 1 : -1;
-    parts += 1;
-  }
-  if (rsi7 != null) {
-    tilt += Math.max(-1, Math.min(1, (rsi7 - 50) / 25));
-    parts += 1;
-  }
-  return parts ? tilt / parts : 0;
-}
-
-async function generateBinarySignal(symbolRaw, durationMinutes) {
-  const duration = Math.max(
-    config.binary.minDurationMinutes,
-    Math.min(config.binary.maxDurationMinutes, durationMinutes)
+async function fetchAllData(pair) {
+  const tfEntries = await Promise.all(
+    config.timeframes.map(async (tf) => {
+      try {
+        return [tf, await binance.getSpotKlines(pair, tf, 260)];
+      } catch (err) {
+        logger.warn(`fetchAllData: ${tf} klines failed for ${pair}: ${err.message}`);
+        return [tf, null];
+      }
+    })
   );
+  const timeframeCandles = Object.fromEntries(tfEntries);
 
-  const candles = await twelvedata.getTimeSeries(
-    symbolRaw,
-    '1min',
-    Math.max(60, config.binary.lookbackMinutesForStats)
-  );
-  if (candles.length < 30) {
-    throw new Error(`Not enough recent 1-minute data for ${symbolRaw} to analyze (got ${candles.length} candles)`);
+  const [futures15m, orderBook, openInterest, funding, ticker24h] = await Promise.all([
+    binance.getFuturesKlines(pair, '15m', 260).catch(() => null),
+    binance.getSpotOrderBook(pair, 100).catch(() => null),
+    binance.getFuturesOpenInterest(pair).catch(() => null),
+    binance.getFundingRate(pair).catch(() => null),
+    binance.get24hStats(pair).catch(() => null),
+  ]);
+
+  return { timeframeCandles, futures15m, orderBook, openInterest, funding, ticker24h };
+}
+
+// ---- Requirement 4: Data Failure Protection ----
+// Core inputs (15m + 1h candles, order book) are mandatory - anything
+// missing, too short, or stale means the bot cannot reliably analyze the
+// pair right now, so it returns NO TRADE - DATA UNAVAILABLE rather than
+// guessing or generating a signal off partial data. Futures-only fields
+// (OI, funding, futures volume) are treated as optional - useful when
+// present, but their absence alone should not block spot-based analysis.
+function validateCoreData(data) {
+  const problems = [];
+  const c15 = data.timeframeCandles['15m'];
+  const c1h = data.timeframeCandles['1h'];
+
+  if (!c15 || c15.length < 60) problems.push('15m candle data missing or incomplete');
+  if (!c1h || c1h.length < 60) problems.push('1h candle data missing or incomplete');
+  if (!data.orderBook || !data.orderBook.bids?.length || !data.orderBook.asks?.length) {
+    problems.push('order book data missing or empty');
   }
 
-  const closes = candles.map((c) => c.close);
-  // Entry price: use the live quote (Twelve Data's /price endpoint) instead
-  // of the last completed 1-minute candle close, which can be up to ~60s
-  // stale. Falls back to the candle close if the live quote call fails for
-  // any reason (rate limit, symbol not supported on /price, etc).
-  let entryPrice = closes[closes.length - 1];
-  try {
-    const livePrice = await twelvedata.getCurrentPrice(symbolRaw);
-    if (Number.isFinite(livePrice) && livePrice > 0) entryPrice = livePrice;
-  } catch (err) {
-    logger.warn(`Live price fetch failed for ${symbolRaw}, using last candle close instead: ${err.message}`);
+  if (c15 && c15.length) {
+    const lastCloseTime = c15[c15.length - 1].closeTime;
+    const staleMs = Date.now() - lastCloseTime;
+    if (staleMs > 5 * 60 * 1000) problems.push('market data appears delayed/stale');
   }
-  const rets = logReturns(closes.slice(-config.binary.lookbackMinutesForStats));
-  const driftPerMin = mean(rets);
-  const volPerMin = stdev(rets, driftPerMin);
 
-  const tilt = technicalTilt(candles);
-  // Tilt can shift drift by at most 1 stdev-per-minute worth - i.e. it can
-  // meaningfully lean the estimate but never override what volatility itself
-  // measured.
-  const adjustedDrift = driftPerMin + tilt * volPerMin;
+  return problems;
+}
 
-  const checkpoints = config.binary.checkpointFractions.map((frac) => {
-    const t = Math.max(1, Math.round(duration * frac));
-    const meanLogRet = adjustedDrift * t;
-    const sdLogRet = volPerMin * Math.sqrt(t);
-    const z = sdLogRet > 0 ? meanLogRet / sdLogRet : (meanLogRet > 0 ? 5 : meanLogRet < 0 ? -5 : 0);
-    const probAbove = normalCdf(z);
-    const direction = probAbove >= 0.5 ? 'ABOVE' : 'BELOW';
-    const probability = direction === 'ABOVE' ? probAbove : 1 - probAbove;
-    return {
-      fraction: frac,
-      label: frac === 1 ? 'Expiry' : `${Math.round(frac * 100)}% (${t} min)`,
-      minutes: t,
-      direction,
-      probabilityPct: Number((probability * 100).toFixed(1)),
-    };
-  });
-
-  const finalCp = checkpoints[checkpoints.length - 1];
-  const confidence = finalCp.probabilityPct;
-
+function dataUnavailableSignal(pair, problems) {
   return {
-    symbol: symbolRaw.toUpperCase(),
-    entryPrice,
-    durationMinutes: duration,
-    direction: finalCp.direction,
-    confidence,
-    highTrust: confidence >= config.binary.highTrustThreshold,
-    driftPerMin,
-    volPerMin,
-    tilt,
-    checkpoints,
+    id: store.newSignalId(pair),
+    pair,
+    direction: 'NO TRADE',
+    entry: null,
+    stopLoss: null,
+    takeProfit: null,
+    riskReward: null,
+    confidence: 0,
     signalTime: Date.now(),
+    validityMinutes: 0,
+    regime: { trend: 'UNKNOWN', volatility: 'UNKNOWN' },
+    categoryScores: {},
+    reason: ['NO TRADE - DATA UNAVAILABLE', ...problems],
+    topReasons: ['NO TRADE - DATA UNAVAILABLE', ...problems],
+    topConfirmations: [],
+    topInvalidationFactors: problems,
+    expectedValue: null,
+    grade: 'D',
+    riskAssessment: null,
+    marketConditions: null,
+    trapWarnings: [],
+    status: 'NO_TRADE',
+    highestPriceAfter: null,
+    lowestPriceAfter: null,
+    mfe: 0,
+    mae: 0,
+    result: null,
   };
 }
 
-module.exports = { generateBinarySignal, normalCdf };
+function computeEntrySlTp(direction, entry, atr15m, srInfo, minRR) {
+  const slDistance = Math.max(atr15m * 1.5, entry * 0.001); // floor to avoid zero-width stops
+  const targetRR = Math.max(minRR, 2);
+  let tpDistance = slDistance * targetRR;
+
+  let stopLoss, takeProfit;
+  if (direction === 'BUY') {
+    stopLoss = entry - slDistance;
+    const res = srInfo.resistance;
+    if (res && res.price > entry) {
+      const levelDist = res.price - entry;
+      if (levelDist > slDistance * minRR * 0.8) {
+        tpDistance = Math.min(tpDistance * 1.4, levelDist); // prefer a real level, capped
+      }
+    }
+    takeProfit = entry + tpDistance;
+  } else {
+    stopLoss = entry + slDistance;
+    const sup = srInfo.support;
+    if (sup && sup.price < entry) {
+      const levelDist = entry - sup.price;
+      if (levelDist > slDistance * minRR * 0.8) {
+        tpDistance = Math.min(tpDistance * 1.4, levelDist);
+      }
+    }
+    takeProfit = entry - tpDistance;
+  }
+
+  const actualRisk = Math.abs(entry - stopLoss);
+  const actualReward = Math.abs(takeProfit - entry);
+  const riskReward = actualRisk > 0 ? actualReward / actualRisk : 0;
+
+  return { stopLoss, takeProfit, riskReward: Number(riskReward.toFixed(2)), slDistance, tpDistance };
+}
+
+function validityMinutes(regime) {
+  if (regime.trend === 'TRENDING' && regime.volatility !== 'HIGH_VOLATILITY') return 90;
+  if (regime.trend === 'RANGING') return 45;
+  if (regime.volatility === 'HIGH_VOLATILITY') return 30;
+  return 60;
+}
+
+// ---- Requirement 9: Explainable Signals ----
+// Builds a short, data-derived breakdown of why the signal fired (or
+// didn't), so every signal can be reviewed/debugged later without re-running
+// the whole analysis. Kept to a handful of top items rather than a full dump.
+function buildExplanation({ combined, direction, trapFindings, marketConditions, baseReasons }) {
+  const tradeSign = direction === 'BUY' ? 1 : direction === 'SELL' ? -1 : 0;
+  const entries = Object.entries(combined.breakdown || {});
+
+  const confirmations = entries
+    .filter(([, v]) => tradeSign !== 0 && Math.sign(v.score) === tradeSign && Math.abs(v.score) > 0.15)
+    .sort((a, b) => Math.abs(b[1].score) - Math.abs(a[1].score))
+    .slice(0, 4)
+    .map(([cat, v]) => `${CATEGORY_LABELS[cat] || cat} (score ${v.score})`);
+
+  const invalidations = entries
+    .filter(([, v]) => tradeSign !== 0 && Math.sign(v.score) === -tradeSign && Math.abs(v.score) > 0.15)
+    .sort((a, b) => Math.abs(b[1].score) - Math.abs(a[1].score))
+    .slice(0, 4)
+    .map(([cat, v]) => `${CATEGORY_LABELS[cat] || cat} disagreed (score ${v.score})`);
+
+  trapFindings.forEach((f) => invalidations.push(`${f.type}: ${f.note}`));
+  if (marketConditions?.abnormal) {
+    invalidations.push(`Abnormal market conditions detected (${marketConditions.severity})`);
+  }
+
+  const topReasons = direction === 'NO TRADE'
+    ? [...baseReasons]
+    : [
+        `Live direction: ${direction} at ${combined.confidence}% confidence`,
+        `${combined.alignedCategories}/${combined.totalCategories} categories aligned`,
+      ];
+
+  return {
+    topReasons: topReasons.slice(0, 5),
+    topConfirmations: confirmations,
+    topInvalidationFactors: invalidations.slice(0, 5),
+    featureImportance: computeFeatureImportance(combined.breakdown),
+  };
+}
+
+// ---- Requirement 14: Feature Importance ----
+// Ranks every category by the actual magnitude of its weighted contribution
+// to the final score - this is exact and transparent (the scoring engine IS
+// a weighted sum, see scoring.js), not an approximation of a black-box
+// model the way SHAP values would be for a real ML model.
+function computeFeatureImportance(breakdown) {
+  const entries = Object.entries(breakdown || {}).map(([cat, v]) => {
+    const contribution = v.score * (v.regimeWeight ?? 1);
+    return { category: CATEGORY_LABELS[cat] || cat, score: v.score, contribution: Number(contribution.toFixed(3)) };
+  });
+  const totalMagnitude = entries.reduce((a, e) => a + Math.abs(e.contribution), 0) || 1;
+  return entries
+    .map((e) => ({ ...e, importancePct: Number(((Math.abs(e.contribution) / totalMagnitude) * 100).toFixed(1)) }))
+    .sort((a, b) => b.importancePct - a.importancePct);
+}
+
+// ---- Direction & risk decision, isolated from data-fetch/scoring so the
+// control flow above stays flat and readable instead of nested if/else. ----
+async function decideDirection({ pair, combined, marketConditions, currentPrice, atr15m, supportResistance, riskAssessment, anomalies }) {
+  const reason = [];
+  let effectiveConfidence = combined.confidence;
+
+  // ---- Institutional Risk Engine: overrides everything else. ----
+  if (!riskAssessment.allowed) {
+    reason.push('NO TRADE - risk protection active', ...riskAssessment.reasons);
+    return { direction: 'NO TRADE', effectiveConfidence, reason, entrySlTp: null, ev: null, grade: 'D' };
+  }
+
+  // ---- Market Anomaly Detection: an EXTREME flag (flash move, extreme
+  // volatility percentile) blocks new trades until conditions normalize. ----
+  const extremeAnomaly = anomalies.flags.find((f) => f.severity === 'EXTREME');
+  if (extremeAnomaly) {
+    reason.push(`NO TRADE - market anomaly detected: ${extremeAnomaly.note}`);
+    return { direction: 'NO TRADE', effectiveConfidence, reason, entrySlTp: null, ev: null, grade: 'D' };
+  }
+
+  // ---- Requirement 1: News & Event Filter ----
+  if (marketConditions.forceNoTrade) {
+    const causes = [
+      marketConditions.priceShock ? 'sudden volatility shock' : null,
+      marketConditions.newsHits.length ? 'major news event' : null,
+    ].filter(Boolean).join(', ') || 'severe conditions';
+    reason.push(`NO TRADE - abnormal market conditions detected (${causes})`);
+    return { direction: 'NO TRADE', effectiveConfidence, reason, entrySlTp: null, ev: null, grade: 'D' };
+  }
+
+  if (marketConditions.abnormal && marketConditions.confidencePenaltyPct > 0) {
+    effectiveConfidence = Math.round(effectiveConfidence * (1 - marketConditions.confidencePenaltyPct / 100));
+    reason.push(`Confidence reduced ${marketConditions.confidencePenaltyPct}% due to abnormal market conditions`);
+  }
+
+  const meetsConfidence = effectiveConfidence >= config.engine.minConfidence;
+  const meetsAlignment = combined.alignedCategories >= config.engine.minAlignedCategories;
+  const hasDirection = combined.direction === 'BUY' || combined.direction === 'SELL';
+
+  if (!meetsConfidence || !meetsAlignment || !hasDirection) {
+    if (!meetsConfidence) reason.push(`Confidence ${effectiveConfidence}% below required ${config.engine.minConfidence}%`);
+    if (!meetsAlignment) reason.push(`Only ${combined.alignedCategories}/${combined.totalCategories} categories aligned (need ${config.engine.minAlignedCategories})`);
+    if (!hasDirection) reason.push('No clear directional consensus across analyses');
+    return { direction: 'NO TRADE', effectiveConfidence, reason, entrySlTp: null, ev: null, grade: 'D' };
+  }
+
+  // ---- Requirement 2: Duplicate Signal Protection ----
+  const activeDuplicate = await store.getActiveSignal(pair, combined.direction);
+  if (activeDuplicate) {
+    reason.push(
+      `Duplicate signal protection: an active ${combined.direction} signal for ${pair} ` +
+      `is already open (id ${activeDuplicate.id}) - waiting for it to complete, expire, or invalidate`
+    );
+    return { direction: 'NO TRADE', effectiveConfidence, reason, entrySlTp: null, ev: null, grade: 'D' };
+  }
+
+  const entrySlTp = computeEntrySlTp(combined.direction, currentPrice, atr15m, supportResistance, config.engine.minRiskReward);
+  if (entrySlTp.riskReward < config.engine.minRiskReward) {
+    reason.push('Risk:Reward below minimum threshold after applying structure-based targets');
+    return { direction: 'NO TRADE', effectiveConfidence, reason, entrySlTp: null, ev: null, grade: 'D' };
+  }
+
+  // ---- Expected Value Engine: reject negative-EV setups even if confidence
+  // and alignment both passed - a high win-rate at a bad RR (or vice versa)
+  // can still be a losing bet over time. ----
+  const ev = evEngine.computeExpectedValue(effectiveConfidence, entrySlTp.riskReward);
+  if (!ev.positive) {
+    reason.push(`Negative expected value (${ev.expectedValueR}R) - setup rejected despite passing confidence/alignment`);
+    return { direction: 'NO TRADE', effectiveConfidence, reason, entrySlTp: null, ev, grade: 'D' };
+  }
+
+  // ---- Signal Quality Grading: only configured grades (default A+, A) are
+  // allowed to actually fire; everything else becomes NO TRADE. ----
+  const grade = gradingSvc.gradeSignal({
+    confidence: effectiveConfidence,
+    expectedValueR: ev.expectedValueR,
+    alignedCategories: combined.alignedCategories,
+    totalCategories: combined.totalCategories,
+  });
+  if (!config.engine.allowedGrades.includes(grade)) {
+    reason.push(`Setup graded ${grade} - below minimum required grade (${config.engine.allowedGrades.join('/')})`);
+    return { direction: 'NO TRADE', effectiveConfidence, reason, entrySlTp: null, ev, grade };
+  }
+
+  return { direction: combined.direction, effectiveConfidence, reason, entrySlTp, ev, grade };
+}
+
+async function generateSignal(pair, { persist = true } = {}) {
+  const data = await fetchAllData(pair);
+
+  const dataProblems = validateCoreData(data);
+  if (dataProblems.length) {
+    logger.warn(`generateSignal: data unavailable for ${pair}: ${dataProblems.join('; ')}`);
+    return dataUnavailableSignal(pair, dataProblems);
+  }
+
+  const { timeframeCandles } = data;
+  const currentPrice = timeframeCandles['15m'][timeframeCandles['15m'].length - 1].close;
+  const regime = regimeSvc.detectRegime(timeframeCandles['1h']);
+  const regimeWeights = regimeSvc.getRegimeWeights(regime);
+  const adaptiveWeights = await store.getAllFilterPerformance(CATEGORIES);
+
+  const trend = analysis.scoreTrend(timeframeCandles);
+  const momentum = analysis.scoreMomentum(timeframeCandles);
+  const volume = analysis.scoreVolume(timeframeCandles['15m'], data.futures15m);
+  const structure = analysis.scoreStructure(timeframeCandles['1h']);
+  // Still computed (not a category vote anymore) - its support/resistance
+  // levels are used below in computeEntrySlTp() to place a smarter take-profit.
+  const supportResistance = analysis.scoreSupportResistance(timeframeCandles['1h'], currentPrice);
+  const { liquidity, orderbook } = analysis.scoreLiquidityAndOrderBook(data.orderBook);
+
+  const categoryScores = {
+    trend: { score: trend.score },
+    momentum: { score: momentum.score },
+    volume: { score: volume.score },
+    structure: { score: structure.score },
+    liquidity: { score: liquidity.score },
+    orderbook: { score: orderbook.score },
+  };
+
+  const combined = scoringSvc.combineScores(
+    categoryScores,
+    regimeWeights,
+    adaptiveWeights,
+    config.engine.adaptiveMinSamples
+  );
+
+  const atr15m = indicators.atr(timeframeCandles['15m'], 14) || currentPrice * 0.002;
+
+  // ---- Requirement 1: News & Event Filter (abnormal vs normal conditions) ----
+  const marketConditions = await newsFilter.assessMarketConditions({
+    candles15m: timeframeCandles['15m'],
+    atr: atr15m,
+    regime,
+    pair,
+  });
+
+  // ---- Institutional Risk Engine input: real closed-signal history ----
+  const allSignalsForRisk = await store.getAllSignals();
+  const riskAssessment = riskEngine.assessRisk(allSignalsForRisk);
+
+  // ---- Market Anomaly Detection ----
+  const anomalies = marketAnomaly.detectAnomalies({ candles15m: timeframeCandles['15m'], atrValue: atr15m, regime });
+
+  const { direction, effectiveConfidence, reason, entrySlTp, ev, grade } = await decideDirection({
+    pair, combined, marketConditions, currentPrice, atr15m, supportResistance, riskAssessment, anomalies,
+  });
+
+  const explanation = buildExplanation({
+    combined, direction, trapFindings: [], marketConditions, baseReasons: reason,
+  });
+
+  const signal = {
+    id: store.newSignalId(pair),
+    pair,
+    direction,
+    entry: direction !== 'NO TRADE' ? currentPrice : null,
+    stopLoss: entrySlTp ? Number(entrySlTp.stopLoss.toFixed(6)) : null,
+    takeProfit: entrySlTp ? Number(entrySlTp.takeProfit.toFixed(6)) : null,
+    riskReward: entrySlTp ? entrySlTp.riskReward : null,
+    confidence: effectiveConfidence,
+    liveConfidence: combined.liveConfidence,
+    calibrationFactor: combined.calibrationFactor,
+    expectedValue: ev,
+    grade,
+    riskAssessment,
+    signalTime: Date.now(),
+    validityMinutes: validityMinutes(regime),
+    regime,
+    categoryScores: combined.breakdown,
+    reason,
+    topReasons: explanation.topReasons,
+    topConfirmations: explanation.topConfirmations,
+    topInvalidationFactors: explanation.topInvalidationFactors,
+    featureImportance: explanation.featureImportance,
+    marketConditions: {
+      abnormal: marketConditions.abnormal,
+      severity: marketConditions.severity,
+      priceShock: marketConditions.priceShock,
+      newsHits: marketConditions.newsHits,
+    },
+    trapWarnings: [],
+    anomalies: anomalies.flags,
+    paper: config.engine.paperMode,
+    // tracking fields, filled in by the tracker job later
+    status: direction === 'NO TRADE' ? 'NO_TRADE' : 'OPEN',
+    highestPriceAfter: direction !== 'NO TRADE' ? currentPrice : null,
+    lowestPriceAfter: direction !== 'NO TRADE' ? currentPrice : null,
+    mfe: 0,
+    mae: 0,
+    result: null,
+  };
+
+  if (direction !== 'NO TRADE') {
+    // Extended structural invalidation level + whatever real recovery-odds
+    // history has accumulated so far for this pair+direction (see
+    // invalidationAnalysis.js - reads only, never guesses a number).
+    signal.extendedInvalidation = await invalidationAnalysis.buildExtendedInvalidation({
+      direction,
+      entry: currentPrice,
+      stopLoss: signal.stopLoss,
+      candles4h: timeframeCandles['4h'],
+      pair,
+    }).catch((err) => {
+      logger.warn(`extendedInvalidation failed for ${pair}: ${err.message}`);
+      return null;
+    });
+
+    if (persist) {
+      await store.saveNewSignal(signal);
+    }
+  }
+
+  return signal;
+}
+
+module.exports = { generateSignal, CATEGORIES };
