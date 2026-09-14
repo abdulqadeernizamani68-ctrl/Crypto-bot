@@ -6,6 +6,8 @@ const { Client, GatewayIntentBits, Partials } = require('discord.js');
 const config = require('./config');
 const logger = require('./utils/logger');
 const { handleSignalCommand } = require('./commands/signal');
+const { handleAnalyzeCommand } = require('./commands/analyze');
+const { handleHistoryCommand } = require('./commands/historyAnalyze');
 const { handleAccuracyCommand } = require('./commands/accuracy');
 const { handleBinaryCommand } = require('./commands/binary');
 const { handleBinaryAccuracyCommand } = require('./commands/binaryAccuracy');
@@ -16,7 +18,6 @@ const { handleHealthCommand } = require('./commands/health');
 const { runTrackerCycle } = require('./services/tracker');
 const { runPostmortemCycle } = require('./services/postmortemTracker');
 const { runBinaryTrackerCycle } = require('./services/binaryTracker');
-const { runScanCycle } = require('./services/scanner');
 
 let clientInstance = null;
 
@@ -75,6 +76,32 @@ function startDiscordBot() {
     if (!text.trim().startsWith('!')) return;
 
     logger.info(`Command from ${message.author.tag}: ${text}`);
+
+    // !analyze needs the raw message object (to edit its own status
+    // message with a live elapsed-time counter), so it's handled directly
+    // here instead of going through the generic string-reply routeCommand.
+    if (/^!analyze\b/i.test(text.trim())) {
+      const arg = text.trim().replace(/^!analyze\s*/i, '');
+      try {
+        await handleAnalyzeCommand(message, arg);
+      } catch (err) {
+        logger.error('analyze command handling error:', err.message);
+      }
+      return;
+    }
+
+    // Same deal for !history - it fetches/crunches a lot of candles, so it
+    // needs to edit its own live status message too.
+    if (/^!history\b/i.test(text.trim())) {
+      const arg = text.trim().replace(/^!history\s*/i, '');
+      try {
+        await handleHistoryCommand(message, arg);
+      } catch (err) {
+        logger.error('history command handling error:', err.message);
+      }
+      return;
+    }
+
     try {
       const reply = await routeCommand(text);
       if (reply) {
@@ -99,7 +126,7 @@ function startHealthServer() {
   });
 }
 
-function startTrackerCron(discordClient) {
+function startTrackerCron() {
   cron.schedule('*/2 * * * *', () => {
     runTrackerCycle().catch((err) => logger.error('Tracker cycle failed:', err.message));
   });
@@ -117,22 +144,12 @@ function startTrackerCron(discordClient) {
     runBinaryTrackerCycle().catch((err) => logger.error('Binary tracker cycle failed:', err.message));
   });
   logger.info('Binary signal tracker cron scheduled (every 1 minute).');
-
-  if (config.scanner.enabled) {
-    const everyN = Math.max(1, Math.round(config.scanner.intervalMinutes));
-    cron.schedule(`*/${everyN} * * * *`, () => {
-      runScanCycle(discordClient).catch((err) => logger.error('Scanner cycle failed:', err.message));
-    });
-    logger.info(`Auto-scanner cron scheduled (every ${everyN} minutes, watching ${config.scanner.pairs.length} pairs).`);
-  } else {
-    logger.info('Auto-scanner is disabled (set SCANNER_ENABLED=true and SCANNER_CHANNEL_ID to turn it on).');
-  }
 }
 
 async function main() {
   startHealthServer();
-  const client = startDiscordBot();
-  startTrackerCron(client);
+  startDiscordBot();
+  startTrackerCron();
 }
 
 main().catch((err) => {
