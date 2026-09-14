@@ -77,23 +77,17 @@ discord: {
     // Fixed checkpoint fractions of the chosen duration - e.g. a 20-minute
     // trade gets checked at 5, 10, 15 and 20 minutes in.
     checkpointFractions: [0.25, 0.5, 0.75, 1.0],
-    minDurationMinutes: num(process.env.BINARY_MIN_DURATION_MIN, 1),
-    maxDurationMinutes: num(process.env.BINARY_MAX_DURATION_MIN, 60),
+    // 5 seconds to 48 hours. Below ~1 minute the model is extrapolating
+    // below the resolution of the underlying 1-minute candle data (see the
+    // honesty note in binaryEngine.js) - it still computes a number, but
+    // treat sub-minute confidence as a rougher estimate than 1min+.
+    minDurationMinutes: num(process.env.BINARY_MIN_DURATION_MIN, 5 / 60),
+    maxDurationMinutes: num(process.env.BINARY_MAX_DURATION_MIN, 48 * 60),
     // Confidence at/above this is called out as a high-trust setup in the
     // reply - it's just a label threshold, the confidence number itself is
     // always computed fresh from live volatility + drift, never hardcoded.
     highTrustThreshold: num(process.env.BINARY_HIGH_TRUST_THRESHOLD, 90),
     lookbackMinutesForStats: num(process.env.BINARY_LOOKBACK_MIN, 120),
-    // Max percentage-point nudge the short-term technical tilt (EMA/RSI) can
-    // apply to a checkpoint's probability - kept small and additive so it
-    // can never dominate or compound with time the way injecting it into
-    // the drift term did (that was the root cause of the 95%+-on-everything
-    // bug - see binaryEngine.js).
-    tiltMaxPct: num(process.env.BINARY_TILT_MAX_PCT, 8),
-    // Hard ceiling/floor on any reported probability. No legitimate 1-60
-    // minute prediction should ever claim near-certainty - this caps it
-    // regardless of what the underlying model computes, as a safety net.
-    maxProbabilityPct: num(process.env.BINARY_MAX_PROBABILITY_PCT, 95),
   },
 
   // ---- Institutional risk engine ----
@@ -105,24 +99,5 @@ discord: {
     maxWeeklyLossR: num(process.env.MAX_WEEKLY_LOSS_R, 6),
     maxDrawdownR: num(process.env.MAX_DRAWDOWN_R, 8),
     maxConsecutiveLosses: num(process.env.MAX_CONSECUTIVE_LOSSES, 4),
-  },
-
-  // ---- Auto-scanner ----
-  // Instead of the user manually guessing which single pair to poll,
-  // this watches a whole list on a schedule and posts to Discord only when
-  // a pair actually clears every gate (same decideDirection path as a
-  // manual !signal - nothing special or looser about scanner-found
-  // signals). Solves "I keep checking BTCUSDT and it's always quiet" by
-  // having the bot check many pairs so the user doesn't have to.
-  scanner: {
-    enabled: (process.env.SCANNER_ENABLED || 'false') === 'true',
-    pairs: (process.env.SCANNER_PAIRS || 'BTCUSDT,ETHUSDT,BNBUSDT,SOLUSDT,XRPUSDT,ADAUSDT,DOGEUSDT,AVAXUSDT,LINKUSDT,DOTUSDT')
-      .split(',').map((p) => p.trim().toUpperCase()).filter(Boolean),
-    intervalMinutes: num(process.env.SCANNER_INTERVAL_MIN, 15),
-    channelId: process.env.SCANNER_CHANNEL_ID || '',
-    // Delay between each pair's data fetch within one scan cycle, so a
-    // 10-20 pair watchlist doesn't burst Binance's rate limit the way
-    // spamming !signal manually did.
-    perPairDelayMs: num(process.env.SCANNER_PER_PAIR_DELAY_MS, 3000),
   },
 };
