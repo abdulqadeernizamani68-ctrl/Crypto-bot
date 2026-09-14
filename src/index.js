@@ -8,6 +8,7 @@ const logger = require('./utils/logger');
 const { handleSignalCommand } = require('./commands/signal');
 const { handleAnalyzeCommand } = require('./commands/analyze');
 const { handleHistoryCommand } = require('./commands/historyAnalyze');
+const { handleCandleCommand } = require('./commands/candle');
 const { handleAccuracyCommand } = require('./commands/accuracy');
 const { handleBinaryCommand } = require('./commands/binary');
 const { handleBinaryAccuracyCommand } = require('./commands/binaryAccuracy');
@@ -98,6 +99,18 @@ function startDiscordBot() {
         await handleHistoryCommand(message, arg);
       } catch (err) {
         logger.error('history command handling error:', err.message);
+      }
+      return;
+    }
+
+    // Same deal for !candle - fetches candles + runs pattern matching, so
+    // it also needs to edit its own live status message.
+    if (/^!candle\b/i.test(text.trim())) {
+      const arg = text.trim().replace(/^!candle\s*/i, '');
+      try {
+        await handleCandleCommand(message, arg);
+      } catch (err) {
+        logger.error('candle command handling error:', err.message);
       }
       return;
     }
