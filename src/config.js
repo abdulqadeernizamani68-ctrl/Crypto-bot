@@ -22,13 +22,17 @@ discord: {
     port: num(process.env.PORT, 3000),
   },
   engine: {
-    minConfidence: num(process.env.MIN_CONFIDENCE, 65),
-    minAlignedCategories: num(process.env.MIN_ALIGNED_CATEGORIES, 4),
-    minRiskReward: num(process.env.MIN_RISK_REWARD, 1.5),
+    // Lowered from the original strict defaults (65/4/1.5/"A+,A") - those
+    // combined with 13 scoring categories caused near-permanent NO TRADE.
+    // These are baked in as the code default now (not left to an env var
+    // someone has to remember to set on the hosting platform).
+    minConfidence: num(process.env.MIN_CONFIDENCE, 40),
+    minAlignedCategories: num(process.env.MIN_ALIGNED_CATEGORIES, 2),
+    minRiskReward: num(process.env.MIN_RISK_REWARD, 1.0),
     adaptiveMinSamples: num(process.env.ADAPTIVE_MIN_SAMPLES, 20),
     // Only these grades are allowed to actually fire as BUY/SELL by default -
     // everything else becomes NO TRADE with the grade shown as the reason.
-    allowedGrades: (process.env.ALLOWED_GRADES || 'A+,A').split(',').map((g) => g.trim()),
+    allowedGrades: (process.env.ALLOWED_GRADES || 'A+,A,B,C').split(',').map((g) => g.trim()),
     // When true, signals are still computed and logged/tracked but are
     // clearly labelled as PAPER and should not be treated as live calls.
     // Use this to validate any new logic/weight change before flipping it
