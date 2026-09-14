@@ -122,6 +122,19 @@ async function generateBinarySignal(symbolRaw, durationMinutes) {
   // measured.
   const adjustedDrift = driftPerMin + tilt * volPerMin;
 
+  // Drift decay: the drift/tilt estimate above was measured over
+  // `statsLookback` minutes of recent data. Naively extrapolating it out to
+  // an arbitrary duration makes confidence climb toward 100% purely because
+  // duration grew (drift scales with t, volatility only with sqrt(t)) - not
+  // because the forecast actually got more reliable. This decays the
+  // drift's influence as the requested duration goes beyond the window it
+  // was measured over, so confidence stops being a near-mechanical function
+  // of duration and instead tapers back toward 50% for horizons the recent
+  // data genuinely can't speak to.
+  function decayedDrift(t) {
+    return adjustedDrift * (statsLookback / (statsLookback + t));
+  }
+
   const checkpoints = config.binary.checkpointFractions.map((frac) => {
     // Below 1 minute we keep a fractional t (in minutes) instead of forcing
     // a whole-minute round-up - the math still works (sqrt-time scaling of
@@ -129,7 +142,7 @@ async function generateBinarySignal(symbolRaw, durationMinutes) {
     // resolution of the 1-minute candle data, so treat it as a rougher
     // estimate than 1min+ durations.
     const t = duration >= 1 ? Math.max(1, Math.round(duration * frac)) : Math.max(1 / 60, duration * frac);
-    const meanLogRet = adjustedDrift * t;
+    const meanLogRet = decayedDrift(t) * t;
     const sdLogRet = volPerMin * Math.sqrt(t);
     const z = sdLogRet > 0 ? meanLogRet / sdLogRet : (meanLogRet > 0 ? 5 : meanLogRet < 0 ? -5 : 0);
     const probAbove = normalCdf(z);
