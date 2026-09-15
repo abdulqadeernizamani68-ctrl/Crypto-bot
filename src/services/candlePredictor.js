@@ -120,6 +120,92 @@ function renderStructure(candles, count = 15) {
   return lines.join('\n');
 }
 
+// How long until the currently-forming candle closes.
+function computeCountdown(formingCandle, intervalMs) {
+  const closeTime = formingCandle.time + intervalMs;
+  const remainingMs = Math.max(0, closeTime - Date.now());
+  const totalSec = Math.round(remainingMs / 1000);
+  const mins = Math.floor(totalSec / 60);
+  const secs = totalSec % 60;
+  return { remainingMs, label: mins > 0 ? `${mins}m ${secs}s` : `${secs}s` };
+}
+
+// Real candlestick chart image (via QuickChart's hosted Chart.js renderer -
+// no native chart libraries needed on the server) showing: the last 2
+// CLOSED candles, the candle that's currently forming (live values), and a
+// semi-transparent "predicted" candle showing where the forming one is
+// expected to settle - plus a dashed horizontal line at that predicted
+// close price, labeled with the price.
+function buildChartUrl({ symbol, tfKey, closedCandles, formingCandle, predictedClose, intervalMs }) {
+  const tf = TIMEFRAMES[tfKey];
+  const last2Closed = closedCandles.slice(-2);
+
+  const realData = [...last2Closed, formingCandle].map((c) => ({
+    x: c.time, o: c.open, h: c.high, l: c.low, c: c.close,
+  }));
+
+  // Placed one interval after the forming candle's open time - visually
+  // "next in line" - but it represents the PREDICTED FINAL VALUE of the
+  // currently-forming candle (not a further-future candle), labeled as such.
+  const predictedPoint = {
+    x: formingCandle.time + intervalMs,
+    o: formingCandle.close,
+    h: Math.max(formingCandle.high, formingCandle.close, predictedClose),
+    l: Math.min(formingCandle.low, formingCandle.close, predictedClose),
+    c: predictedClose,
+  };
+
+  const config = {
+    type: 'candlestick',
+    data: {
+      datasets: [
+        {
+          label: `${symbol} ${tf.label}`,
+          data: realData,
+          color: { up: '#22c55e', down: '#ef4444', unchanged: '#999999' },
+        },
+        {
+          label: 'Predicted close of current candle',
+          data: [predictedPoint],
+          color: { up: 'rgba(34,197,94,0.4)', down: 'rgba(239,68,68,0.4)', unchanged: 'rgba(153,153,153,0.4)' },
+        },
+      ],
+    },
+    options: {
+      plugins: {
+        legend: { display: true, position: 'bottom' },
+        annotation: {
+          annotations: {
+            predictedLine: {
+              type: 'line',
+              yMin: predictedClose,
+              yMax: predictedClose,
+              borderColor: '#eab308',
+              borderWidth: 2,
+              borderDash: [6, 4],
+              label: {
+                display: true,
+                content: `Predicted: ${predictedClose}`,
+                position: 'end',
+                backgroundColor: '#eab308',
+                color: '#000000',
+              },
+            },
+          },
+        },
+      },
+      scales: {
+        x: { type: 'time', time: { unit: tf.ms >= 3600000 ? 'hour' : 'minute' } },
+        y: { title: { display: true, text: 'Price' } },
+      },
+    },
+  };
+
+  const encoded = encodeURIComponent(JSON.stringify(config));
+  return `https://quickchart.io/chart?c=${encoded}&v=3&w=900&h=500&bkg=white`;
+}
+
+
 module.exports = {
   TIMEFRAMES,
   normalizeTimeframe,
@@ -127,4 +213,6 @@ module.exports = {
   nextCandleStats,
   predictFormingCandle,
   renderStructure,
+  computeCountdown,
+  buildChartUrl,
 };
