@@ -9,6 +9,7 @@
 // pattern-frequency, not a guarantee. Small sample sizes are surfaced,
 // not hidden.
 
+const axios = require('axios');
 const hist = require('./historicalAnalysis');
 const binance = require('./binance');
 const twelvedata = require('./twelvedata');
@@ -136,7 +137,7 @@ function computeCountdown(formingCandle, intervalMs) {
 // semi-transparent "predicted" candle showing where the forming one is
 // expected to settle - plus a dashed horizontal line at that predicted
 // close price, labeled with the price.
-function buildChartUrl({ symbol, tfKey, closedCandles, formingCandle, predictedClose, intervalMs }) {
+async function createChartUrl({ symbol, tfKey, closedCandles, formingCandle, predictedClose, intervalMs }) {
   const tf = TIMEFRAMES[tfKey];
   const last2Closed = closedCandles.slice(-2);
 
@@ -185,7 +186,7 @@ function buildChartUrl({ symbol, tfKey, closedCandles, formingCandle, predictedC
               borderDash: [6, 4],
               label: {
                 display: true,
-                content: `Predicted: ${predictedClose}`,
+                content: `Predicted: ${predictedClose.toFixed(5)}`,
                 position: 'end',
                 backgroundColor: '#eab308',
                 color: '#000000',
@@ -201,6 +202,18 @@ function buildChartUrl({ symbol, tfKey, closedCandles, formingCandle, predictedC
     },
   };
 
+  const postBody = { chart: config, width: 900, height: 500, backgroundColor: 'white', version: '3' };
+
+  // Discord messages are capped at 2000 characters - the full GET URL with
+  // the config embedded can alone exceed that, so this asks QuickChart for
+  // a short URL instead. Falls back to the long GET URL (which may get
+  // truncated by the caller) only if the short-URL request itself fails.
+  try {
+    const { data } = await axios.post('https://quickchart.io/chart/create', postBody, { timeout: 10000 });
+    if (data && data.success && data.url) return data.url;
+  } catch (err) {
+    // fall through to long URL
+  }
   const encoded = encodeURIComponent(JSON.stringify(config));
   return `https://quickchart.io/chart?c=${encoded}&v=3&w=900&h=500&bkg=white`;
 }
@@ -214,5 +227,5 @@ module.exports = {
   predictFormingCandle,
   renderStructure,
   computeCountdown,
-  buildChartUrl,
+  createChartUrl,
 };
