@@ -7,10 +7,12 @@ function normalizePair(raw) {
   return /^[A-Z0-9]{5,15}$/.test(p) ? p : null;
 }
 
-function formatResult(symbol, tfKey, market, stats, formingPred, structureText) {
+function formatResult(symbol, tfKey, market, stats, formingPred, predictedClose, countdown, chartUrl) {
   const tf = cp.TIMEFRAMES[tfKey];
   const lines = [
-    `*${symbol} - Candle Prediction* (${market}, timeframe: ${tf.label})`,
+    `*${symbol} - Candle Chart & Prediction* (${market}, timeframe: ${tf.label})`,
+    '',
+    chartUrl,
     '',
     `Current pattern state: \`${stats.currentState}\` (trend|RSI zone|volatility|last closed candle color)`,
     `Similar past setups found: ${stats.sampleSize}`,
@@ -30,18 +32,25 @@ function formatResult(symbol, tfKey, market, stats, formingPred, structureText) 
 
   lines.push(
     `📌 Currently forming ${tf.label} candle:`,
-    `- ${formingPred.elapsedFraction}% of the way through its time window`,
+    `- ${formingPred.elapsedFraction}% of the way through its time window - closes in **${countdown.label}**`,
     `- Move so far: ${formingPred.partialMovePct}%`,
-    `- Likely to close: **${formingPred.likelyColor}** (${formingPred.confidencePct}% confidence - blends the historical tendency above with the actual move so far; leans more on the actual move the further through the window it is)`,
+    `- Likely to close: **${formingPred.likelyColor}** at approx **${predictedClose.toFixed(5)}** (${formingPred.confidencePct}% confidence)`,
     '',
-    `Recent ${tf.label} candle structure (oldest to newest, last one still forming):`,
-    '```',
-    structureText,
-    '```',
-    '',
-    '_Historical pattern frequency + live partial data, not a guarantee. Analysis only, not financial advice._'
+    '_Chart: solid candles are real (last 2 closed + the live one still forming). The faded candle and dashed yellow line are the prediction - where this candle is expected to settle, not a guarantee. Historical pattern frequency + live partial data. Analysis only, not financial advice._'
   );
   return lines.join('\n');
+}
+
+// Projects where the currently-forming candle is likely to close: starts
+// from the live price, and extends further in the predicted direction the
+// earlier we are in the candle's time window (more time left = more
+// potential move still to come; less time left = closer to where we are
+// right now).
+function projectClose(forming, stats, formingPred) {
+  const dirSign = formingPred.likelyColor === 'GREEN' ? 1 : -1;
+  const avgBodyPct = stats.avgBodyPct != null ? stats.avgBodyPct : 0.05; // fallback if no historical matches yet
+  const remainingFraction = 1 - formingPred.elapsedFraction / 100;
+  return forming.close * (1 + dirSign * (avgBodyPct / 100) * remainingFraction);
 }
 
 // Needs the raw Discord `message` object so it can edit its own live
@@ -87,10 +96,15 @@ async function handleCandleCommand(message, argText) {
     const stats = cp.nextCandleStats(closed);
     const tf = cp.TIMEFRAMES[tfKey];
     const formingPred = cp.predictFormingCandle(forming, tf.ms, stats.greenPct);
-    const structureText = cp.renderStructure(candles, 15);
+    const predictedClose = projectClose(forming, stats, formingPred);
+    const countdown = cp.computeCountdown(forming, tf.ms);
+    const chartUrl = cp.buildChartUrl({
+      symbol: pair, tfKey, closedCandles: closed, formingCandle: forming,
+      predictedClose, intervalMs: tf.ms,
+    });
 
     clearInterval(timer);
-    const resultText = formatResult(pair, tfKey, market, stats, formingPred, structureText);
+    const resultText = formatResult(pair, tfKey, market, stats, formingPred, predictedClose, countdown, chartUrl);
     await statusMsg.edit(`${resultText}\n\n⏱️ Took ${elapsedSec()}s.`);
   } catch (err) {
     clearInterval(timer);
