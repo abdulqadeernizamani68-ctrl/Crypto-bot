@@ -98,14 +98,19 @@ async function handleCandleCommand(message, argText) {
     const formingPred = cp.predictFormingCandle(forming, tf.ms, stats.greenPct);
     const predictedClose = projectClose(forming, stats, formingPred);
     const countdown = cp.computeCountdown(forming, tf.ms);
-    const chartUrl = cp.buildChartUrl({
+    const chartUrl = await cp.createChartUrl({
       symbol: pair, tfKey, closedCandles: closed, formingCandle: forming,
       predictedClose, intervalMs: tf.ms,
     });
 
     clearInterval(timer);
     const resultText = formatResult(pair, tfKey, market, stats, formingPred, predictedClose, countdown, chartUrl);
-    await statusMsg.edit(`${resultText}\n\n⏱️ Took ${elapsedSec()}s.`);
+    const fullText = `${resultText}\n\n⏱️ Took ${elapsedSec()}s.`;
+    // Safety net for Discord's 2000-char message cap - only matters if the
+    // QuickChart short-URL request above failed and fell back to the long
+    // GET URL (rare).
+    const safeText = fullText.length > 2000 ? `${fullText.slice(0, 1970)}\n... (truncated)` : fullText;
+    await statusMsg.edit(safeText);
   } catch (err) {
     clearInterval(timer);
     logger.error('candle command failed:', err.message);
