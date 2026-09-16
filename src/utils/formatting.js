@@ -215,16 +215,19 @@ function buildReasonBullets(s) {
 
 function formatBinarySignalMessage(signal) {
   const durationLabel = binaryEngine.formatMinutes(signal.durationMinutes);
+  const finalCp = signal.checkpoints[signal.checkpoints.length - 1];
   const lines = [
     `*${signal.symbol} - Binary/Time-based Signal*`,
     '',
     `Entry Price: ${fmtNum(signal.entryPrice)}`,
     `Duration: ${durationLabel}`,
-    `Predicted at expiry: price will be *${signal.direction}* entry`,
+    `Predicted at expiry: price will be *${signal.direction}* entry, around **${fmtNum(finalCp.predictedPrice)}** (likely range ${fmtNum(finalCp.rangeLow)} - ${fmtNum(finalCp.rangeHigh)})`,
     `Confidence: ${signal.confidence}%${signal.highTrust ? ' 🔥 HIGH-TRUST SETUP' : ''}`,
     '',
-    'Chances at each checkpoint (from measured recent volatility + drift):',
-    ...signal.checkpoints.map((cp) => `- ${cp.label}: ${cp.direction} with ${cp.probabilityPct}% chance`),
+    'Chances + expected price at each checkpoint (from measured recent volatility + drift):',
+    ...signal.checkpoints.map((cp) =>
+      `- ${cp.label}: ${cp.direction} with ${cp.probabilityPct}% chance - expected ~${fmtNum(cp.predictedPrice)} (range ${fmtNum(cp.rangeLow)}-${fmtNum(cp.rangeHigh)})`
+    ),
     '',
   ];
   if (signal.durationMinutes < 1) {
@@ -234,8 +237,10 @@ function formatBinarySignalMessage(signal) {
     );
   }
   lines.push(
-    '_Estimate on the real market feed (Twelve Data), not Quotex\'s own OTC price -',
-    'see README for why those can differ. Analysis only, not financial advice._'
+    '_Price targets are a point estimate + ~68% range (1 std dev), not a',
+    'guarantee - actual price can land outside the range. Estimate on the',
+    'real market feed (Twelve Data), not Quotex\'s own OTC price - see',
+    'README for why those can differ. Analysis only, not financial advice._'
   );
   return lines.join('\n');
 }
