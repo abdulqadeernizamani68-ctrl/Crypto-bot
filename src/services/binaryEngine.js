@@ -33,11 +33,18 @@ const twelvedata = require('./twelvedata');
 const logger = require('../utils/logger');
 
 function normalCdf(x) {
+  // CRITICAL FIX: the previous version had an extra "return 1 - prob"
+  // after already flipping prob for x>0 - a double-flip that inverted the
+  // result whenever |x| was large (i.e. whenever the signal was actually
+  // confident). That meant ABOVE/BELOW was often backwards exactly when it
+  // mattered most. Verified against known values: normalCdf(0) = 0.5,
+  // normalCdf(2) ≈ 0.977, normalCdf(-2) ≈ 0.023 - all correct with this
+  // version; the old version returned the flipped complement for |x| > 0.
   const t = 1 / (1 + 0.2316419 * Math.abs(x));
   const d = 0.3989423 * Math.exp((-x * x) / 2);
   let prob = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
   if (x > 0) prob = 1 - prob;
-  return 1 - prob; // P(Z <= x)
+  return prob; // P(Z <= x)
 }
 
 function logReturns(closes) {
@@ -95,32 +102,51 @@ async function generateBinarySignal(symbolRaw, durationMinutes) {
   // keep the API call and the stats window reasonable.
   const statsLookback = Math.max(60, config.binary.lookbackMinutesForStats, Math.min(720, Math.ceil(duration * 1.5)));
 
-  const candles = await twelvedata.getTimeSeries(symbolRaw, '1min', statsLookback);
+  // Fetch candle history AND the live quote at the same time (not one after
+  // the other) - candles took ~0.2-0.8s before this, and doing the live
+  // price fetch only after that finished meant entryPrice reflected a price
+  // from further in the past than necessary. Running them in parallel gets
+  // the live price as close to "right now" as this API call can give.
+  const [candles, livePriceResult] = await Promise.all([
+    twelvedata.getTimeSeries(symbolRaw, '1min', statsLookback),
+    twelvedata.getCurrentPrice(symbolRaw).catch((err) => {
+      logger.warn(`Live price fetch failed for ${symbolRaw}, will fall back to last candle close: ${err.message}`);
+      return null;
+    }),
+  ]);
   if (candles.length < 30) {
     throw new Error(`Not enough recent 1-minute data for ${symbolRaw} to analyze (got ${candles.length} candles)`);
   }
 
   const closes = candles.map((c) => c.close);
-  // Entry price: use the live quote (Twelve Data's /price endpoint) instead
-  // of the last completed 1-minute candle close, which can be up to ~60s
-  // stale. Falls back to the candle close if the live quote call fails for
-  // any reason (rate limit, symbol not supported on /price, etc).
+  // Entry price: prefer the live quote fetched above over the last
+  // completed 1-minute candle close, which can be up to ~60s stale.
   let entryPrice = closes[closes.length - 1];
-  try {
-    const livePrice = await twelvedata.getCurrentPrice(symbolRaw);
-    if (Number.isFinite(livePrice) && livePrice > 0) entryPrice = livePrice;
-  } catch (err) {
-    logger.warn(`Live price fetch failed for ${symbolRaw}, using last candle close instead: ${err.message}`);
-  }
+  if (Number.isFinite(livePriceResult) && livePriceResult > 0) entryPrice = livePriceResult;
   const rets = logReturns(closes.slice(-statsLookback));
   const driftPerMin = mean(rets);
   const volPerMin = stdev(rets, driftPerMin);
+
+  // Statistical-significance shrinkage: a drift estimated from a short,
+  // noisy window can have a sign that's essentially a coin flip rather than
+  // a real trend - e.g. mean(rets) is small and close to its own standard
+  // error. Without this, the direction can flip between two calls made
+  // seconds apart even though nothing meaningfully changed in the market.
+  // This shrinks the drift toward zero in proportion to how indistinguishable
+  // it is from noise (driftPerMin vs its standard error), so a genuinely
+  // weak/noisy signal pulls confidence back toward 50% instead of
+  // confidently asserting a random direction.
+  const driftStdErr = rets.length > 1 ? volPerMin / Math.sqrt(rets.length) : volPerMin;
+  const driftReliability = driftStdErr > 0
+    ? (driftPerMin * driftPerMin) / (driftPerMin * driftPerMin + driftStdErr * driftStdErr)
+    : 1;
+  const reliableDrift = driftPerMin * driftReliability;
 
   const tilt = technicalTilt(candles);
   // Tilt can shift drift by at most 1 stdev-per-minute worth - i.e. it can
   // meaningfully lean the estimate but never override what volatility itself
   // measured.
-  const adjustedDrift = driftPerMin + tilt * volPerMin;
+  const adjustedDrift = reliableDrift + tilt * volPerMin;
 
   // Drift decay: the drift/tilt estimate above was measured over
   // `statsLookback` minutes of recent data. Naively extrapolating it out to
@@ -148,12 +174,21 @@ async function generateBinarySignal(symbolRaw, durationMinutes) {
     const probAbove = normalCdf(z);
     const direction = probAbove >= 0.5 ? 'ABOVE' : 'BELOW';
     const probability = direction === 'ABOVE' ? probAbove : 1 - probAbove;
+    // Point estimate + a rough range (±1 stdev of the log-return, ~68% of
+    // outcomes fall inside it) for how far price is expected to move by
+    // this checkpoint - not just the direction/probability.
+    const predictedPrice = entryPrice * Math.exp(meanLogRet);
+    const rangeLow = entryPrice * Math.exp(meanLogRet - sdLogRet);
+    const rangeHigh = entryPrice * Math.exp(meanLogRet + sdLogRet);
     return {
       fraction: frac,
       label: frac === 1 ? 'Expiry' : `${Math.round(frac * 100)}% (${formatMinutes(t)})`,
       minutes: t,
       direction,
       probabilityPct: Number((probability * 100).toFixed(1)),
+      predictedPrice,
+      rangeLow: Math.min(rangeLow, rangeHigh),
+      rangeHigh: Math.max(rangeLow, rangeHigh),
     };
   });
 
