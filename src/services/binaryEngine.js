@@ -31,6 +31,7 @@ const config = require('../config');
 const indicators = require('./indicators');
 const twelvedata = require('./twelvedata');
 const logger = require('../utils/logger');
+const structureSvc = require('./structure');
 
 function normalCdf(x) {
   // CRITICAL FIX: the previous version had an extra "return 1 - prob"
@@ -73,27 +74,58 @@ function stdev(arr, m) {
   return Math.sqrt(variance);
 }
 
-function technicalTilt(candles) {
-  // Multi-indicator confluence, bounded to [-1, 1]. Everything here is
-  // computed LOCALLY from the same 1-minute candles already fetched for
-  // this signal - zero extra Twelve Data API calls. The free plan's
-  // 8-calls/minute, 800/day budget is spent entirely on the 2 calls this
-  // function's caller already makes (candle history + live price); adding
-  // more indicators costs nothing extra as long as they're derived from
-  // that same candle array rather than fetched separately.
-  //
-  // Indicator choice (standard TA practice, not ad-hoc):
-  // - EMA9/21/50 stack + MACD histogram -> trend direction
-  // - RSI(7) + Stochastic(14,3) -> momentum, tuned fast since durations
-  //   here are mostly minutes, not days
-  // - Bollinger %B -> mean-reversion pressure at price extremes, which
-  //   matters more the shorter the duration (an overextended move often
-  //   snaps back within a few minutes, before a short expiry)
-  // - ADX(14) as a trend-strength GATE: the trend components (EMA, MACD)
-  //   are down-weighted when ADX shows a weak/choppy market, since
-  //   trend-following signals are least reliable exactly when there's no
-  //   real trend to follow. This is a standard technique for avoiding
-  //   coin-flip trend calls in ranging conditions.
+// How far price can be from a support/resistance level to still count as
+// "near" it, as a % of price. Not a magic number - it's just the window
+// used to decide whether a level is currently relevant.
+const SR_PROXIMITY_PCT = 0.15;
+
+function srProximityScore(entryPrice, nearest) {
+  let score = 0;
+  if (nearest.resistance) {
+    const distPct = ((nearest.resistance.price - entryPrice) / entryPrice) * 100;
+    if (distPct >= 0 && distPct < SR_PROXIMITY_PCT) {
+      const strength = Math.min(1, nearest.resistance.touches / 3); // more touches = more reliable level
+      score -= 0.5 + 0.5 * strength * (1 - distPct / SR_PROXIMITY_PCT);
+    }
+  }
+  if (nearest.support) {
+    const distPct = ((entryPrice - nearest.support.price) / entryPrice) * 100;
+    if (distPct >= 0 && distPct < SR_PROXIMITY_PCT) {
+      const strength = Math.min(1, nearest.support.touches / 3);
+      score += 0.5 + 0.5 * strength * (1 - distPct / SR_PROXIMITY_PCT);
+    }
+  }
+  return Math.max(-1, Math.min(1, score));
+}
+
+// Multi-factor confluence, bounded to [-1, 1]. Everything here is computed
+// LOCALLY from the same 1-minute candles already fetched for this signal -
+// zero extra Twelve Data API calls. The free plan's 8-calls/minute,
+// 800/day budget is spent entirely on the 2 calls this function's caller
+// already makes (candle history + live price); adding more factors costs
+// nothing extra as long as they're derived from that same candle array
+// rather than fetched separately.
+//
+// Factor choice (standard TA practice, not ad-hoc):
+// - EMA9/21/50 stack + MACD histogram -> trend direction
+// - RSI(7) + Stochastic(14,3) -> momentum, tuned fast since durations here
+//   are mostly minutes, not days
+// - Bollinger %B -> mean-reversion pressure at price extremes, which
+//   matters more the shorter the duration (an overextended move often
+//   snaps back within a few minutes, before a short expiry)
+// - Market structure (swing HH/HL vs LH/LL) + Support/Resistance proximity
+//   + Breakout/Retest - genuine price-action read, not just indicators
+// - ADX(14) as a trend-strength GATE: the trend components (EMA, MACD) are
+//   down-weighted when ADX shows a weak/choppy market, since
+//   trend-following signals are least reliable exactly when there's no
+//   real trend to follow.
+//
+// Honesty note: liquidity / order-book depth is NOT included here. Twelve
+// Data (the forex/binary data source this bot uses) does not expose
+// order-book data for these pairs the way an exchange like Binance does -
+// there is no real liquidity data available to analyze, so this doesn't
+// pretend to have one.
+function buildConfluence(candles, structureInfo, srScore, breakoutScore) {
   const ema9 = indicators.ema(candles, 9);
   const ema21 = indicators.ema(candles, 21);
   const ema50 = indicators.ema(candles, 50);
@@ -112,6 +144,13 @@ function technicalTilt(candles) {
 
   let tilt = 0;
   let weight = 0;
+  const breakdown = [];
+  function add(factor, score, w = 1) {
+    if (score == null || !Number.isFinite(score)) return;
+    tilt += score * w;
+    weight += w;
+    breakdown.push({ factor, score: Number(score.toFixed(2)) });
+  }
 
   if (ema9 != null && ema21 != null && ema50 != null) {
     let emaScore = 0;
@@ -119,19 +158,16 @@ function technicalTilt(candles) {
     else if (ema9 < ema21 && ema21 < ema50) emaScore = -1;
     else if (ema9 > ema21) emaScore = 0.5;
     else if (ema9 < ema21) emaScore = -0.5;
-    tilt += emaScore * adxStrength;
-    weight += 1;
+    add('EMA trend stack', emaScore * adxStrength);
   }
 
   if (macdVal && Number.isFinite(macdVal.histogram)) {
     const macdScore = macdVal.histogram > 0 ? 1 : macdVal.histogram < 0 ? -1 : 0;
-    tilt += macdScore * adxStrength;
-    weight += 1;
+    add('MACD', macdScore * adxStrength);
   }
 
   if (rsi7 != null) {
-    tilt += Math.max(-1, Math.min(1, (rsi7 - 50) / 25));
-    weight += 1;
+    add('RSI(7)', Math.max(-1, Math.min(1, (rsi7 - 50) / 25)));
   }
 
   if (stoch && Number.isFinite(stoch.k) && Number.isFinite(stoch.d)) {
@@ -139,8 +175,7 @@ function technicalTilt(candles) {
     // Classic stochastic reversal cue: %K crossing %D from an extreme zone.
     if (stoch.k < 20 && stoch.k > stoch.d) stochScore = Math.max(stochScore, 0.6);
     if (stoch.k > 80 && stoch.k < stoch.d) stochScore = Math.min(stochScore, -0.6);
-    tilt += stochScore;
-    weight += 1;
+    add('Stochastic', stochScore);
   }
 
   if (bb && Number.isFinite(bb.upper) && Number.isFinite(bb.lower) && bb.upper > bb.lower) {
@@ -153,11 +188,83 @@ function technicalTilt(candles) {
     if (percentB > 1) bbScore = -Math.min(1, (percentB - 1) * 2 + 0.5);
     else if (percentB < 0) bbScore = Math.min(1, -percentB * 2 + 0.5);
     else bbScore = (0.5 - percentB) * 0.6; // mild pull toward the mean even inside the bands
-    tilt += bbScore;
-    weight += 1;
+    add('Bollinger %B', bbScore);
   }
 
-  return weight > 0 ? Math.max(-1, Math.min(1, tilt / weight)) : 0;
+  add('Market structure', structureInfo.score);
+  add('Support/Resistance', srScore);
+  add('Breakout/Retest', breakoutScore);
+
+  return {
+    tilt: weight > 0 ? Math.max(-1, Math.min(1, tilt / weight)) : 0,
+    breakdown: breakdown.sort((a, b) => Math.abs(b.score) - Math.abs(a.score)),
+  };
+}
+
+// Current volatility vs its OWN recent history (percentile), not an
+// arbitrary fixed threshold - what's "high" for one pair on one day is
+// "normal" for another, so this always judges a pair against itself.
+function volatilityRegime(candles) {
+  const series = indicators.atrSeries(candles, 14).filter(Number.isFinite);
+  if (series.length < 20) return { regime: 'UNKNOWN', percentile: null };
+  const atrNow = series[series.length - 1];
+  const sorted = [...series].sort((a, b) => a - b);
+  const rank = sorted.findIndex((v) => v >= atrNow);
+  const percentile = Math.round((rank / sorted.length) * 100);
+  const regime = percentile <= 25 ? 'LOW' : percentile >= 75 ? 'HIGH' : 'NORMAL';
+  return { regime, percentile };
+}
+
+// Groups consecutive 1-minute candles into synthetic larger candles - pure
+// local math on data already fetched, no extra API call.
+function resampleCandles(candles, factor) {
+  const out = [];
+  for (let i = 0; i + factor <= candles.length; i += factor) {
+    const chunk = candles.slice(i, i + factor);
+    out.push({
+      time: chunk[0].time,
+      open: chunk[0].open,
+      high: Math.max(...chunk.map((c) => c.high)),
+      low: Math.min(...chunk.map((c) => c.low)),
+      close: chunk[chunk.length - 1].close,
+    });
+  }
+  return out;
+}
+
+// Cheap proxy for "how clean/tradeable does this timeframe look right
+// now" - combines trend strength (ADX) with how clearly structured price
+// is (HH/HL or LH/LL vs mixed/choppy). Used only to compare timeframes
+// against each other, not as a standalone score.
+function confluenceQuality(candles) {
+  if (candles.length < 30) return 0;
+  const adxVal = indicators.adx(candles, 14);
+  const adxStrength = adxVal && Number.isFinite(adxVal.adx) ? Math.max(0, Math.min(1, (adxVal.adx - 15) / 15)) : 0;
+  const structureInfo = structureSvc.classifyStructure(candles);
+  return (adxStrength + Math.abs(structureInfo.score)) / 2;
+}
+
+// Compares the requested timeframe's own signal quality against 5-min and
+// 15-min resampled versions of the SAME candles (no extra API calls).
+// Only suggests a change when another timeframe looks MEANINGFULLY
+// cleaner (not just marginally) - computed fresh every call from this
+// pair's actual current data, not a fixed rule.
+function suggestBetterTimeframe(candles) {
+  const nativeQuality = confluenceQuality(candles);
+  const candidates = [
+    { label: '5-15 minute', factor: 5, minCandles: 60 },
+    { label: '15-60 minute', factor: 15, minCandles: 60 },
+  ];
+  let best = null;
+  for (const c of candidates) {
+    const resampled = resampleCandles(candles, c.factor);
+    if (resampled.length < c.minCandles) continue;
+    const quality = confluenceQuality(resampled);
+    if (quality > nativeQuality + 0.15 && (!best || quality > best.quality)) {
+      best = { label: c.label, quality: Number(quality.toFixed(2)), nativeQuality: Number(nativeQuality.toFixed(2)) };
+    }
+  }
+  return best;
 }
 
 async function generateBinarySignal(symbolRaw, durationMinutes) {
@@ -211,7 +318,18 @@ async function generateBinarySignal(symbolRaw, durationMinutes) {
     : 1;
   const reliableDrift = driftPerMin * driftReliability;
 
-  const tilt = technicalTilt(candles);
+  // Market structure, support/resistance and breakout/retest - all derived
+  // from the SAME candles already fetched above, zero extra API calls.
+  const structureInfo = structureSvc.classifyStructure(candles);
+  const srLevels = structureSvc.findKeyLevels(candles);
+  const nearestSR = structureSvc.nearestLevels(entryPrice, srLevels);
+  const srScore = srProximityScore(entryPrice, nearestSR);
+  const breakoutInfo = structureSvc.detectBreakoutRetest(candles, srLevels);
+  const volRegime = volatilityRegime(candles);
+  const timeframeSuggestion = suggestBetterTimeframe(candles);
+
+  const confluence = buildConfluence(candles, structureInfo, srScore, breakoutInfo.score);
+  const tilt = confluence.tilt;
   // Tilt can shift drift by at most 1 stdev-per-minute worth - i.e. it can
   // meaningfully lean the estimate but never override what volatility itself
   // measured.
@@ -274,6 +392,15 @@ async function generateBinarySignal(symbolRaw, durationMinutes) {
     driftPerMin,
     volPerMin,
     tilt,
+    confluenceBreakdown: confluence.breakdown,
+    structure: { pattern: structureInfo.pattern },
+    supportResistance: {
+      support: nearestSR.support ? { price: nearestSR.support.price, touches: nearestSR.support.touches } : null,
+      resistance: nearestSR.resistance ? { price: nearestSR.resistance.price, touches: nearestSR.resistance.touches } : null,
+    },
+    breakout: breakoutInfo.type !== 'NONE' ? { type: breakoutInfo.type, retested: breakoutInfo.retested } : null,
+    volatilityRegime: volRegime,
+    timeframeSuggestion,
     checkpoints,
     signalTime: Date.now(),
   };
