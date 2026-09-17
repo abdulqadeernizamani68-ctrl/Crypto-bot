@@ -9,8 +9,8 @@ function findSwings(candles, lookback = 3) {
     const c = candles[i];
     const isHigh = windowSlice.every((w) => w.high <= c.high);
     const isLow = windowSlice.every((w) => w.low >= c.low);
-    if (isHigh) swingHighs.push({ index: i, price: c.high, time: c.openTime });
-    if (isLow) swingLows.push({ index: i, price: c.low, time: c.openTime });
+    if (isHigh) swingHighs.push({ index: i, price: c.high, time: c.time ?? c.openTime });
+    if (isLow) swingLows.push({ index: i, price: c.low, time: c.time ?? c.openTime });
   }
   return { swingHighs, swingLows };
 }
