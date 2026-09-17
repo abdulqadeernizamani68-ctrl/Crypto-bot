@@ -55,6 +55,18 @@ function atr(candles, period = 14) {
   return values.length ? values[values.length - 1] : null;
 }
 
+// Full ATR series (not just the last value) - used to judge whether
+// CURRENT volatility is high/low relative to its OWN recent history
+// (a percentile), rather than an arbitrary fixed threshold.
+function atrSeries(candles, period = 14) {
+  return ATR.calculate({
+    period,
+    high: candles.map((c) => c.high),
+    low: candles.map((c) => c.low),
+    close: candles.map((c) => c.close),
+  });
+}
+
 function stochastic(candles, period = 14, signalPeriod = 3) {
   const values = Stochastic.calculate({
     high: candles.map((c) => c.high),
@@ -81,4 +93,4 @@ function adx(candles, period = 14) {
   return values.length ? values[values.length - 1] : null; // { adx, ... }
 }
 
-module.exports = { ema, emaSeries, rsi, rsiSeries, macd, macdSeries, atr, stochastic, bollingerBands, adx };
+module.exports = { ema, emaSeries, rsi, rsiSeries, macd, macdSeries, atr, atrSeries, stochastic, bollingerBands, adx };
