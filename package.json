@@ -1,7 +1,7 @@
 {
-  "name": "whatsapp-crypto-signal-bot",
-  "version": "1.0.0",
-  "description": "WhatsApp crypto signal bot (analysis only, no auto-trading) - multi timeframe, multi factor confluence engine with performance tracking",
+  "name": "binary-signal-bot",
+  "version": "2.0.0",
+  "description": "Binary/time-based options signal bot (Discord) - multi-factor confluence engine (trend, momentum, market structure, support/resistance, volatility) on live Twelve Data feeds. Analysis only, no auto-trading.",
   "main": "src/index.js",
   "type": "commonjs",
   "scripts": {
@@ -12,7 +12,6 @@
   },
   "dependencies": {
     "discord.js": "^14.16.3",
-    
     "@upstash/redis": "^1.34.0",
     "axios": "^1.7.7",
     "dotenv": "^16.4.5",
