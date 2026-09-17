@@ -1,4 +1,4 @@
-const { EMA, RSI, MACD, ATR } = require('technicalindicators');
+const { EMA, RSI, MACD, ATR, Stochastic, BollingerBands, ADX } = require('technicalindicators');
 
 function closes(candles) {
   return candles.map((c) => c.close);
@@ -55,4 +55,30 @@ function atr(candles, period = 14) {
   return values.length ? values[values.length - 1] : null;
 }
 
-module.exports = { ema, emaSeries, rsi, rsiSeries, macd, macdSeries, atr };
+function stochastic(candles, period = 14, signalPeriod = 3) {
+  const values = Stochastic.calculate({
+    high: candles.map((c) => c.high),
+    low: candles.map((c) => c.low),
+    close: candles.map((c) => c.close),
+    period,
+    signalPeriod,
+  });
+  return values.length ? values[values.length - 1] : null; // { k, d }
+}
+
+function bollingerBands(candles, period = 20, stdDev = 2) {
+  const values = BollingerBands.calculate({ period, values: closes(candles), stdDev });
+  return values.length ? values[values.length - 1] : null; // { middle, upper, lower }
+}
+
+function adx(candles, period = 14) {
+  const values = ADX.calculate({
+    close: candles.map((c) => c.close),
+    high: candles.map((c) => c.high),
+    low: candles.map((c) => c.low),
+    period,
+  });
+  return values.length ? values[values.length - 1] : null; // { adx, ... }
+}
+
+module.exports = { ema, emaSeries, rsi, rsiSeries, macd, macdSeries, atr, stochastic, bollingerBands, adx };
