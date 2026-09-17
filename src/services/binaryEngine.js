@@ -74,21 +74,90 @@ function stdev(arr, m) {
 }
 
 function technicalTilt(candles) {
-  // Bounded to [-1, 1]. EMA9 vs EMA21 cross + RSI7 relative to 50.
+  // Multi-indicator confluence, bounded to [-1, 1]. Everything here is
+  // computed LOCALLY from the same 1-minute candles already fetched for
+  // this signal - zero extra Twelve Data API calls. The free plan's
+  // 8-calls/minute, 800/day budget is spent entirely on the 2 calls this
+  // function's caller already makes (candle history + live price); adding
+  // more indicators costs nothing extra as long as they're derived from
+  // that same candle array rather than fetched separately.
+  //
+  // Indicator choice (standard TA practice, not ad-hoc):
+  // - EMA9/21/50 stack + MACD histogram -> trend direction
+  // - RSI(7) + Stochastic(14,3) -> momentum, tuned fast since durations
+  //   here are mostly minutes, not days
+  // - Bollinger %B -> mean-reversion pressure at price extremes, which
+  //   matters more the shorter the duration (an overextended move often
+  //   snaps back within a few minutes, before a short expiry)
+  // - ADX(14) as a trend-strength GATE: the trend components (EMA, MACD)
+  //   are down-weighted when ADX shows a weak/choppy market, since
+  //   trend-following signals are least reliable exactly when there's no
+  //   real trend to follow. This is a standard technique for avoiding
+  //   coin-flip trend calls in ranging conditions.
   const ema9 = indicators.ema(candles, 9);
   const ema21 = indicators.ema(candles, 21);
+  const ema50 = indicators.ema(candles, 50);
+  const macdVal = indicators.macd(candles);
   const rsi7 = indicators.rsi(candles, 7);
+  const stoch = indicators.stochastic(candles, 14, 3);
+  const bb = indicators.bollingerBands(candles, 20, 2);
+  const adxVal = indicators.adx(candles, 14);
+
+  // 0 at ADX<=15 (no real trend - chop), 1 at ADX>=30 (strong trend).
+  // Unknown/insufficient data -> 0.5 (neutral trust), so this never fully
+  // silences the trend components just because ADX couldn't be computed.
+  const adxStrength = adxVal && Number.isFinite(adxVal.adx)
+    ? Math.max(0, Math.min(1, (adxVal.adx - 15) / 15))
+    : 0.5;
+
   let tilt = 0;
-  let parts = 0;
-  if (ema9 != null && ema21 != null) {
-    tilt += ema9 > ema21 ? 1 : -1;
-    parts += 1;
+  let weight = 0;
+
+  if (ema9 != null && ema21 != null && ema50 != null) {
+    let emaScore = 0;
+    if (ema9 > ema21 && ema21 > ema50) emaScore = 1;
+    else if (ema9 < ema21 && ema21 < ema50) emaScore = -1;
+    else if (ema9 > ema21) emaScore = 0.5;
+    else if (ema9 < ema21) emaScore = -0.5;
+    tilt += emaScore * adxStrength;
+    weight += 1;
   }
+
+  if (macdVal && Number.isFinite(macdVal.histogram)) {
+    const macdScore = macdVal.histogram > 0 ? 1 : macdVal.histogram < 0 ? -1 : 0;
+    tilt += macdScore * adxStrength;
+    weight += 1;
+  }
+
   if (rsi7 != null) {
     tilt += Math.max(-1, Math.min(1, (rsi7 - 50) / 25));
-    parts += 1;
+    weight += 1;
   }
-  return parts ? tilt / parts : 0;
+
+  if (stoch && Number.isFinite(stoch.k) && Number.isFinite(stoch.d)) {
+    let stochScore = Math.max(-1, Math.min(1, (stoch.k - 50) / 40));
+    // Classic stochastic reversal cue: %K crossing %D from an extreme zone.
+    if (stoch.k < 20 && stoch.k > stoch.d) stochScore = Math.max(stochScore, 0.6);
+    if (stoch.k > 80 && stoch.k < stoch.d) stochScore = Math.min(stochScore, -0.6);
+    tilt += stochScore;
+    weight += 1;
+  }
+
+  if (bb && Number.isFinite(bb.upper) && Number.isFinite(bb.lower) && bb.upper > bb.lower) {
+    const lastClose = candles[candles.length - 1].close;
+    const percentB = (lastClose - bb.lower) / (bb.upper - bb.lower);
+    // Mean-reversion read, deliberately inverted from momentum: above the
+    // upper band leans bearish (expect pullback), below the lower band
+    // leans bullish.
+    let bbScore = 0;
+    if (percentB > 1) bbScore = -Math.min(1, (percentB - 1) * 2 + 0.5);
+    else if (percentB < 0) bbScore = Math.min(1, -percentB * 2 + 0.5);
+    else bbScore = (0.5 - percentB) * 0.6; // mild pull toward the mean even inside the bands
+    tilt += bbScore;
+    weight += 1;
+  }
+
+  return weight > 0 ? Math.max(-1, Math.min(1, tilt / weight)) : 0;
 }
 
 async function generateBinarySignal(symbolRaw, durationMinutes) {
