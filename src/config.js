@@ -6,72 +6,23 @@ function num(val, fallback) {
 }
 
 module.exports = {
-  binance: {
-    apiKey: process.env.BINANCE_API_KEY || '',
-    apiSecret: process.env.BINANCE_API_SECRET || '',
-    useFutures: (process.env.BINANCE_USE_FUTURES || 'true') === 'true',
-  },
   redis: {
     url: process.env.UPSTASH_REDIS_REST_URL,
     token: process.env.UPSTASH_REDIS_REST_TOKEN,
   },
-discord: {
+  discord: {
     token: process.env.DISCORD_BOT_TOKEN || '',
   },
+  // Kept even though the Discord !health command was removed - this is a
+  // separate plain HTTP endpoint (src/index.js) that hosting platforms
+  // like Railway use for their own uptime/health checks on the process.
   server: {
     port: num(process.env.PORT, 3000),
   },
-  engine: {
-    // Lowered from the original strict defaults (65/4/1.5/"A+,A") - those
-    // combined with 13 scoring categories caused near-permanent NO TRADE.
-    // These are baked in as the code default now (not left to an env var
-    // someone has to remember to set on the hosting platform).
-    minConfidence: num(process.env.MIN_CONFIDENCE, 40),
-    minAlignedCategories: num(process.env.MIN_ALIGNED_CATEGORIES, 2),
-    minRiskReward: num(process.env.MIN_RISK_REWARD, 1.0),
-    adaptiveMinSamples: num(process.env.ADAPTIVE_MIN_SAMPLES, 20),
-    // Only these grades are allowed to actually fire as BUY/SELL by default -
-    // everything else becomes NO TRADE with the grade shown as the reason.
-    allowedGrades: (process.env.ALLOWED_GRADES || 'A+,A,B,C').split(',').map((g) => g.trim()),
-    // When true, signals are still computed and logged/tracked but are
-    // clearly labelled as PAPER and should not be treated as live calls.
-    // Use this to validate any new logic/weight change before flipping it
-    // on for real, per the "no direct-to-production" requirement.
-    paperMode: (process.env.PAPER_MODE || 'false') === 'true',
-  },
-  news: {
-    enabled: (process.env.NEWS_FILTER_ENABLED || 'true') === 'true',
-    // Optional - if unset, the bot still runs abnormal-condition detection
-    // from live price action alone (see services/newsFilter.js).
-    cryptoPanicToken: process.env.CRYPTOPANIC_API_KEY || '',
-    highImpactWindowMinutes: num(process.env.NEWS_HIGH_IMPACT_WINDOW_MIN, 30),
-    // ATR percentile (0-1, relative to the pair's own recent history) above
-    // which volatility is considered abnormal/extreme rather than merely high.
-    extremeAtrPercentile: num(process.env.EXTREME_ATR_PERCENTILE, 0.95),
-  },
-  timeframes: ['1m', '5m', '15m', '1h', '4h'],
 
-  // ---- Extended (structural) invalidation tracking ----
-  invalidation: {
-    // Time horizons checked after a structural SL is hit, to see whether
-    // price recovers back to the pre-SL reference price. Purely measurement
-    // points - the percentages themselves are always computed live from
-    // Redis history, never hardcoded.
-    checkpoints: [
-      { label: '6 ghante', minutes: 6 * 60 },
-      { label: '1 din', minutes: 24 * 60 },
-      { label: '3 din', minutes: 3 * 24 * 60 },
-      { label: '1 hafta', minutes: 7 * 24 * 60 },
-      { label: '2 hafte', minutes: 14 * 24 * 60 },
-      { label: '1 mahina', minutes: 30 * 24 * 60 },
-      { label: '3 mahine', minutes: 90 * 24 * 60 },
-    ],
-    minSamples: num(process.env.INVALIDATION_MIN_SAMPLES, 12),
-  },
-
-  // ---- Twelve Data (used for binary-option style signals; Binance has no
-  // forex/OTC data, and Quotex's own OTC feed isn't publicly accessible at
-  // all - see binaryEngine.js header for the full honesty note). ----
+  // ---- Twelve Data (used for binary/time-based signals; Quotex's own OTC
+  // feed isn't publicly accessible at all - see binaryEngine.js header for
+  // the full honesty note). ----
   twelvedata: {
     apiKey: process.env.TWELVEDATA_API_KEY || '',
     baseUrl: 'https://api.twelvedata.com',
@@ -92,16 +43,5 @@ discord: {
     // always computed fresh from live volatility + drift, never hardcoded.
     highTrustThreshold: num(process.env.BINARY_HIGH_TRUST_THRESHOLD, 90),
     lookbackMinutesForStats: num(process.env.BINARY_LOOKBACK_MIN, 120),
-  },
-
-  // ---- Institutional risk engine ----
-  // All limits are configurable ceilings; the actual daily/weekly R,
-  // drawdown, and streak numbers are always computed fresh from real closed
-  // signal history (riskEngine.js) - nothing here is a signal-level number.
-  risk: {
-    maxDailyLossR: num(process.env.MAX_DAILY_LOSS_R, 3),
-    maxWeeklyLossR: num(process.env.MAX_WEEKLY_LOSS_R, 6),
-    maxDrawdownR: num(process.env.MAX_DRAWDOWN_R, 8),
-    maxConsecutiveLosses: num(process.env.MAX_CONSECUTIVE_LOSSES, 4),
   },
 };
