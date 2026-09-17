@@ -1,228 +1,161 @@
-# WhatsApp Crypto Signal Bot
+# Binary Signal Bot (Discord)
 
-Analysis-only WhatsApp bot. **No auto-trading, no hardcoded signals.** Every `!signal`
-call fetches live Binance data and runs a multi-factor confluence engine before
-replying `BUY`, `SELL`, or `NO TRADE`.
+Analysis-only Discord bot for binary/time-based options trading. **No auto-trading,
+no hardcoded signals.** Every `!binary` call fetches live market data from Twelve
+Data and runs a multi-factor confluence engine before replying with a direction,
+confidence, and expected price - not a fixed number.
 
 ## What it does
 
-- Two commands only: `!signal BTCUSDT` and `!accuracy`
-- Pulls live data every time: multi-timeframe candles (1m/5m/15m/1h/4h), spot +
-  futures volume, order book depth, open interest, funding rate
-- Scores 12 independent categories (trend, momentum, volatility, volume,
-  structure, support/resistance, breakout/retest, liquidity, order book, open
-  interest, funding, trap/manipulation risk) and combines them with
-  regime-aware + adaptive weights
-- Detects market regime (trending/ranging, high/low volatility) and re-weights
-  categories accordingly
-- Requires multiple independent confirmations + a minimum confidence + a
-  minimum risk:reward before ever issuing BUY/SELL — otherwise `NO TRADE`
-- Saves every signal to Upstash Redis, tracks price path (MFE/MAE, TP/SL hit)
-  every 2 minutes via a cron job, and closes it out as WIN/LOSS
-- `!accuracy` shows win rate, profit factor, max drawdown, streaks, the last
-  few signals' full price journey, and data-driven insights (only once enough
-  samples exist — no invented claims)
-- Filter weights adapt slowly based on each category's own historical hit
-  rate (bounded 0.6x–1.4x, only after 20+ samples) — nothing is hardcoded to
-  one coin or one time period
+- Two commands only: `!binary SYMBOL DURATION` and `!binaryaccuracy`
+- Duration from **5 seconds to 48 hours** - plain number (minutes) or with a
+  unit suffix (`30s`, `2h`, `48h`)
+- Pulls live 1-minute candle history + a live quote on every call - direction
+  and confidence are computed fresh every time, never cached or reused
+- Statistical core: models price as a random walk with a measured drift and
+  volatility (from real recent log-returns), so uncertainty naturally grows
+  the further out the checkpoint is
+- Drift is refined (not replaced) by a multi-factor confluence read:
+  - **Trend**: EMA9/21/50 stack + MACD histogram
+  - **Momentum**: RSI(7) + Stochastic(14,3)
+  - **Mean-reversion**: Bollinger %B (relevant especially for short durations)
+  - **Market structure**: swing-point HH/HL vs LH/LL classification
+  - **Support/Resistance**: clustered swing levels, weighted by how many
+    times each has been touched
+  - **Breakout/Retest**: detects a recent level break and whether it's been
+    retested
+  - Trend-following factors (EMA, MACD) are automatically down-weighted via
+    an **ADX trend-strength gate** when the market is choppy/ranging, since
+    trend signals are least reliable exactly when there's no real trend
+- Statistical-significance shrinkage: a drift estimate that isn't
+  distinguishable from noise (small relative to its own standard error) is
+  pulled back toward zero, so confidence stays honest instead of asserting a
+  coin-flip direction with false certainty
+- Drift-decay: the drift/tilt measured over the recent lookback window is
+  naturally discounted the further the requested duration goes beyond that
+  window, so confidence tapers back toward 50% for horizons the recent data
+  genuinely can't speak to (instead of climbing toward 100% just because the
+  duration got longer)
+- Volatility regime (LOW/NORMAL/HIGH) judged against the pair's **own**
+  recent ATR history - not a fixed threshold
+- Timeframe suggestion: compares the requested duration's own signal clarity
+  against 5-minute and 15-minute resampled versions of the *same* candles
+  (zero extra API calls) and flags it if another range looks meaningfully
+  cleaner
+- Every checkpoint (25%/50%/75%/expiry) reports direction, confidence, **and**
+  an expected price + range - not just up/down
+- Every reply shows the full confluence breakdown (which factors leaned
+  which way and by how much) so a call can be sanity-checked, not just
+  trusted blindly
+- Saves every signal to Upstash Redis and tracks it via a 1-minute cron job
+  to close it out WIN/LOSS at each checkpoint
+- `!binaryaccuracy` shows win rate and per-checkpoint accuracy from real
+  closed signals - shows 0/0 honestly until signals have actually closed
+
+## What it deliberately does NOT do
+
+- **No liquidity/order-book analysis.** Twelve Data (the data source used
+  for these forex/binary-style pairs) does not expose order-book depth the
+  way an exchange API does - there's no real liquidity data to analyze here,
+  so this doesn't fake one.
+- **No promise of matching a broker's OTC price.** If you're checking this
+  against Quotex or a similar broker's OTC pairs, understand that OTC prices
+  are broker-generated and not publicly available from any external API -
+  see the honesty note at the top of `binaryEngine.js`. This bot analyzes
+  the real market feed; non-OTC pairs during real market hours will track
+  much closer to it than synthetic OTC symbols.
 
 ## Architecture
 
 ```
 src/
-  index.js              entrypoint: WhatsApp connection, command routing, cron
-  config.js              env var loading
+  index.js                entrypoint: Discord connection, command routing,
+                           the binary-tracker cron, and a plain HTTP health
+                           endpoint for the hosting platform
+  config.js                env var loading
   services/
-    binance.js             Binance REST client (public market data only)
-    indicators.js           EMA / RSI / MACD / ATR
-    structure.js             swing highs/lows, HH/HL/LH/LL, S/R, breakout+retest
-    trapDetection.js          bull/bear trap, stop hunt, false retest detection
-    newsFilter.js              price-shock + optional news-event abnormal detection
-    regime.js                   market regime detection + regime-based weights
-    analysis.js                   the 12 scoring categories
-    scoring.js                      weighted confluence -> direction + confidence
-    signalEngine.js                   orchestrates everything -> final signal
-    redisStore.js                      Upstash Redis persistence layer
-    tracker.js                      background job: tracks open signals to close
-    waAuthState.js                   Redis-backed WhatsApp session (survives redeploys)
-    accuracy.js                       stats, profit factor, drawdown, insights
+    twelvedata.js            Twelve Data REST client (candles + live quote)
+    indicators.js             EMA / RSI / MACD / ATR / Stochastic /
+                               Bollinger Bands / ADX (all from the
+                               `technicalindicators` package)
+    structure.js               swing highs/lows, HH/HL vs LH/LL structure,
+                                support/resistance clustering, breakout+retest
+    binaryEngine.js              the core engine - combines the statistical
+                                  model with the full confluence read above
+                                  into a direction + confidence + price
+                                  target at each checkpoint
+    binaryStore.js                Redis persistence for signals + accuracy
+    binaryTracker.js               background job: resolves open signals at
+                                    each checkpoint (WIN/LOSS)
+    redisStore.js                   thin Upstash Redis REST wrapper
   commands/
-    signal.js, accuracy.js  thin command handlers
+    binary.js, binaryAccuracy.js  thin command handlers
   utils/
     formatting.js, logger.js
 ```
 
-## 1. Binance API keys
+## 1. Twelve Data API key
 
-Create **read-only** API keys (Spot + Futures market data — do NOT enable
-trading/withdrawal permissions; the bot never places orders, so it doesn't
-need them). Keep them out of git — only put them in Render's environment
-variables.
+Sign up free at https://twelvedata.com - the dashboard shows your API key
+immediately. Free plan: 8 requests/minute, 800/day. This bot uses 2 requests
+per `!binary` call (candle history + live quote), computing every indicator
+and the market-structure read locally from that same data - no extra API
+calls no matter how many factors are added.
 
 ## 2. Upstash Redis
 
 Create a free Redis database at https://upstash.com, then copy the **REST
 URL** and **REST TOKEN** from the database's REST API tab (not the
-`redis://` connection string — this project uses the REST client).
+`redis://` connection string - this project uses the REST client).
 
-## 3. Push to GitHub
+## 3. Discord bot token
 
-```bash
-cd whatsapp-crypto-signal-bot
-git init
-git add .
-git commit -m "Initial commit"
-git branch -M main
-git remote add origin https://github.com/<your-username>/<your-repo>.git
-git push -u origin main
-```
+Create an application + bot at https://discord.com/developers/applications,
+enable the **Message Content** privileged intent under the Bot tab, and copy
+the token from there.
 
-`.env` is git-ignored — never commit real keys.
+## 4. Environment variables
 
-## 4. Deploy on Render
+| Variable | Required | Notes |
+|---|---|---|
+| `DISCORD_BOT_TOKEN` | yes | from the Discord Developer Portal |
+| `TWELVEDATA_API_KEY` | yes | from your Twelve Data dashboard |
+| `UPSTASH_REDIS_REST_URL` | yes | from Upstash |
+| `UPSTASH_REDIS_REST_TOKEN` | yes | from Upstash |
+| `PORT` | no | defaults to 3000; the hosting platform usually sets this itself |
+| `BINARY_MIN_DURATION_MIN` | no | defaults to 5 seconds (`5/60`) |
+| `BINARY_MAX_DURATION_MIN` | no | defaults to 2880 (48 hours) |
+| `BINARY_HIGH_TRUST_THRESHOLD` | no | defaults to 90 (just a display label threshold) |
+| `BINARY_LOOKBACK_MIN` | no | defaults to 120 (minutes of history used for the statistical core) |
 
-1. New → Web Service → connect your GitHub repo (Render auto-detects
-   `render.yaml`, or set Build Command `npm install` / Start Command
-   `npm start` manually).
-2. In the service's **Environment** tab, add all variables from
-   `.env.example` with your real values:
-   - `BINANCE_API_KEY`, `BINANCE_API_SECRET`
-   - `UPSTASH_REDIS_REST_URL`, `UPSTASH_REDIS_REST_TOKEN`
-   - `WA_PHONE_NUMBER` — the WhatsApp number the bot itself will log in as
-     (country code + number, digits only, e.g. `923001234567`)
-   - `WA_ALLOWED_NUMBERS` — comma-separated numbers allowed to use the bot
-   - Tuning vars (`MIN_CONFIDENCE`, etc.) — defaults are fine to start
-3. Deploy. Render will run `npm install && npm start`.
+## 5. Deploy
 
-## 5. Link WhatsApp (no QR needed)
-
-On first boot, with no existing session, the bot requests a **pairing code**
-and prints it in the Render logs:
-
-```
-WhatsApp pairing code: ABCD-1234
-```
-
-On your phone: WhatsApp → Settings → Linked Devices → Link a Device → Link
-with phone number instead → enter that code. The session is then saved to
-Redis, so it survives future redeploys/restarts — you only do this once
-(until you explicitly log out).
+Push to GitHub, then connect the repo in your hosting platform (Railway,
+Render, etc.) with build command `npm install` and start command
+`npm start`. Add the environment variables above in the platform's dashboard.
+(`render.yaml` in this repo is stale/unused if you're not deploying on
+Render - safe to ignore or delete.)
 
 ## 6. Use it
 
-From an allowed WhatsApp number, message the bot's linked number:
+From a channel the bot can see:
 
 ```
-!signal BTCUSDT
-!accuracy
+!binary EURJPY 15
+!binary BTCUSD 30s
+!binary USDJPY 2h
+!binaryaccuracy
 ```
 
 ## Notes
 
-- This is a **read-only market analysis tool**. It never places, modifies, or
-  cancels any order. Nothing here is financial advice.
-- If `!signal` frequently returns `NO TRADE`, that's by design — the engine
-  is tuned to skip low-quality setups rather than force a call.
-- The adaptive weighting only starts influencing scores once a category has
-  20+ closed-signal samples (`ADAPTIVE_MIN_SAMPLES`), so early results behave
-  as a plain rule-based engine and won't overfit to a handful of trades.
-
-### Live data vs. historical data - how they're separated
-
-`BUY` / `SELL` / `NO TRADE` is decided **only** from the current live pass
-(candles, order book, OI, funding fetched fresh on every `!signal` call,
-combined with regime weights that are themselves computed live). Historical
-signal outcomes stored in Redis are never used to pick or flip direction.
-
-Historical data is used for exactly three things:
-
-1. **Confidence calibration** — a bounded multiplier (0.6x–1.4x, only once a
-   category has 20+ closed samples) scales the *live* confidence number up
-   or down. It can pull a borderline setup below the confidence threshold
-   (a legitimate `NO TRADE`), but it can never turn a live BUY into a SELL
-   or vice versa.
-2. **Weight optimization** — the same bounded multiplier nudges how much
-   each category contributes over time, without ever zeroing one out or
-   letting one dominate.
-3. **Strategy validation** — `!accuracy`'s win rate, profit factor,
-   drawdown, streaks, and insights, so you can see what's actually working.
-
-If live analysis and historical performance disagree, live analysis always
-wins for direction — history can only mute the confidence, not overrule the
-call.
-
-## Additional requirements — how each is met
-
-**1. News & Event Filter** — `services/newsFilter.js`. Two independent
-checks run on every `!signal` call: (a) a live price-action shock check
-(current candle's range vs. its own ATR, plus % move vs. recent closes,
-plus the regime's own ATR percentile) that needs no external API and always
-runs; (b) an optional check against CryptoPanic "hot" news for
-hack/exploit, ETF-decision, and macro-event keywords, only if
-`CRYPTOPANIC_API_KEY` is set. Severe conditions (flash-crash-scale shock, or
-a hack headline tied to the asset/an exchange) force `NO TRADE - abnormal
-market conditions detected`; merely "high" abnormal conditions apply a 20%
-confidence penalty instead of blocking outright. Normal conditions are
-untouched.
-
-**2. Duplicate Signal Protection** — `redisStore.getActiveSignal(pair,
-direction)`, checked in `signalEngine.decideDirection` before a signal is
-finalized. If an OPEN signal already exists for the same pair + direction,
-the new one becomes `NO TRADE` with the reason spelled out, instead of
-stacking a duplicate call.
-
-**3. Confidence Validation** — `services/scoring.js`. Confidence is built
-from live category agreement/magnitude, then calibrated (not replaced) by
-each category's own historical hit rate, bounded to a 0.6x–1.4x multiplier
-and only trusted once a category has 20+ closed samples. No fixed or
-marketing-style numbers anywhere in the pipeline.
-
-**4. Data Failure Protection** — `signalEngine.validateCoreData` /
-`dataUnavailableSignal`. If 15m or 1h candles are missing/short, the order
-book is empty, or the latest candle is stale (>5 min old), the bot returns
-`NO TRADE - DATA UNAVAILABLE` with the specific problem(s) listed, instead
-of guessing from partial data or throwing an unhandled error.
-
-**5. Market Trap Detection** — `services/trapDetection.js`, feeding a new
-`trapRisk` scoring category. Detects bull/bear traps (breakout that
-reverses back within a candle or two, especially with a long opposing wick
-or fading volume), stop hunts/liquidity grabs (wick sweep through a level on
-a volume spike that closes back on the original side), false retests (a
-retest of a broken level that fails to hold), and a thin/one-sided
-order-book caution — all computed live from the candles/order book fetched
-for that call, nothing hardcoded per pair.
-
-**6. Security** — Binance keys are read only from `process.env` via
-`config.js`, never logged (the logger only ever receives error messages,
-not the config object), and `.gitignore` excludes `.env`. The bot only
-calls Binance's public market-data endpoints (klines, depth, open interest,
-funding, 24h ticker) — it never touches an order/account/withdrawal
-endpoint, so create the API key as **read-only** with withdrawals disabled
-and, where your exchange account supports it, an IP restriction to your
-Render service's outbound IP.
-
-**7. Anti-Hardcoding** — `analysis.js`, `structure.js`, `regime.js`, and
-`trapDetection.js` all operate purely on the candle/order-book arrays
-passed in for the specific pair and timeframe requested — there is no
-`if (pair === 'BTCUSDT')`-style branching and no fixed date ranges anywhere.
-Historical data is only ever read for performance tracking/calibration
-(see the "Live data vs. historical data" section above), never for
-direction.
-
-**8. Signal Quality Priority** — `NO TRADE` is a first-class, expected
-outcome throughout `decideDirection`, not a fallback to avoid. There is no
-code path that forces a BUY/SELL when conditions are weak.
-
-**9. Explainable Signals** — every signal now carries `topReasons`,
-`topConfirmations`, and `topInvalidationFactors` (built in
-`signalEngine.buildExplanation`), saved alongside the full `categoryScores`
-breakdown, trap findings, and market-condition flags in Redis — enough to
-reconstruct *why* a call was made without re-running the analysis.
-
-**10. Paper Validation For Updates** — set `PAPER_MODE=true` while testing
-any new logic, weight, or threshold change. Signals are still generated,
-saved, and tracked exactly as normal (so you get real accuracy stats), but
-every WhatsApp message is clearly prefixed `[PAPER MODE - not a live call]`.
-Recommended flow: change the logic → run with `PAPER_MODE=true` for a
-stretch → check `!accuracy` on the paper period → only then set
-`PAPER_MODE=false` (or remove it) to go live with that change.
+- This is a **read-only analysis tool**. It never places, modifies, or
+  cancels any trade. Nothing here is financial advice.
+- Confidence and direction are computed fresh on every call from live data -
+  nothing is hardcoded per pair, per duration, or otherwise. Two calls made
+  seconds apart can legitimately return different numbers because the
+  underlying live data genuinely changed.
+- If a short duration and a much longer duration on the same pair return the
+  same direction, that's not a bug - it means the measured drift held up
+  across both horizons. The drift-decay mechanism above is exactly what
+  keeps this from being true automatically just because durations differ.
