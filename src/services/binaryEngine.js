@@ -638,7 +638,17 @@ function computeSignalCore(allCandlesRaw, entryPrice, duration, statsLookback) {
   };
 }
 
-async function generateBinarySignal(symbolRaw, durationMinutes) {
+// ---- Market-data fetch, split out of generateBinarySignal ----
+// This is the ONLY network step of the analysis, and it produces nothing
+// but RAW inputs (candles + live quote + a couple of bookkeeping numbers) -
+// no indicator, no score, no conclusion. Splitting it out lets the unified
+// !market workflow (services/marketWorkflow.js) fetch once and hand the same
+// raw snapshot to BOTH the deterministic bot (generateBinarySignal below)
+// and the independent AI analyst, in parallel, without a second fetch and
+// without either of them waiting on the other. `!binary` still just calls
+// generateBinarySignal(symbol, duration) exactly as before - it fetches
+// internally through this same function.
+async function fetchSignalInputs(symbolRaw, durationMinutes) {
   const duration = Math.max(
     config.binary.minDurationMinutes,
     Math.min(config.binary.maxDurationMinutes, durationMinutes)
@@ -655,18 +665,45 @@ async function generateBinarySignal(symbolRaw, durationMinutes) {
     }),
   ]);
   if (candles.length < 30) {
-    throw new Error(`Not enough recent 1-minute data for ${symbolRaw} to analyze (got ${candles.length} candles)`);
+    const err = new Error(`Not enough recent 1-minute data for ${symbolRaw} to analyze (got ${candles.length} candles)`);
+    err.code = 'INSUFFICIENT_DATA';
+    throw err;
   }
 
   const closes = candles.map((c) => c.close);
   let entryPrice = closes[closes.length - 1];
-  if (Number.isFinite(livePriceResult) && livePriceResult > 0) entryPrice = livePriceResult;
+  let priceSource = 'last-candle-close';
+  if (Number.isFinite(livePriceResult) && livePriceResult > 0) {
+    entryPrice = livePriceResult;
+    priceSource = 'live-quote';
+  }
 
   // Wall-clock staleness check - only meaningful live (see dataQuality.js
   // header for why this is separate from the structural validation that
   // also runs, identically, inside the backtester).
-  const nowMs = Date.now();
-  const staleness = dataQualitySvc.checkStaleness(candles, nowMs, 60000, 5);
+  const fetchedAt = Date.now();
+  const staleness = dataQualitySvc.checkStaleness(candles, fetchedAt, 60000, 5);
+
+  return {
+    symbol: symbolRaw.toUpperCase(),
+    duration,
+    statsLookback,
+    fetchSize,
+    candles,
+    entryPrice,
+    priceSource,
+    staleness,
+    fetchedAt,
+  };
+}
+
+// `prefetchedInputs` (optional) is the object returned by fetchSignalInputs
+// - pass it to reuse an already-fetched snapshot instead of fetching again.
+async function generateBinarySignal(symbolRaw, durationMinutes, prefetchedInputs = null) {
+  const inputs = prefetchedInputs || await fetchSignalInputs(symbolRaw, durationMinutes);
+  const {
+    duration, statsLookback, candles, entryPrice, staleness,
+  } = inputs;
 
   const core = computeSignalCore(candles, entryPrice, duration, statsLookback);
   const {
@@ -780,6 +817,7 @@ async function generateBinarySignal(symbolRaw, durationMinutes) {
 
 module.exports = {
   generateBinarySignal,
+  fetchSignalInputs,
   computeSignalCore,
   requiredFetchSize,
   buildConfluence,
