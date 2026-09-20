@@ -343,7 +343,12 @@ test('geminiProvider: model and key come from config; the right prompt per kind;
     });
     assert.strictEqual(f.calls.length, 2);
     f.calls.forEach((c) => {
-      assert.ok(c.url.includes('/models/model-from-env:generateContent?key=KEY1'), c.url);
+      // Auth goes via the x-goog-api-key header (Google's current guidance),
+      // not the older ?key= query string - so the key must never appear in
+      // the URL itself (which can end up in logs/error messages).
+      assert.ok(c.url.includes('/models/model-from-env:generateContent'), c.url);
+      assert.ok(!c.url.includes('KEY1'), 'API key must not appear in the URL');
+      assert.strictEqual(c.init.headers['x-goog-api-key'], 'KEY1');
       assert.strictEqual(JSON.parse(c.init.body).generationConfig.maxOutputTokens, 1234);
     });
     assert.match(JSON.parse(f.calls[0].init.body).contents[0].parts[0].text, /independent market analyst/);
