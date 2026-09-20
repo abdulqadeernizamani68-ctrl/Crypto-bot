@@ -1,5 +1,7 @@
 const twelvedata = require('./twelvedata');
 const binaryStore = require('./binaryStore');
+const calibrationSvc = require('./calibration');
+const expiryBucketsSvc = require('./expiryBuckets');
 const logger = require('../utils/logger');
 
 function pctDiff(a, b) {
@@ -34,7 +36,7 @@ async function checkOpenBinary(signal) {
     let worstAgainstEntry = signal.worstAgainstEntry ?? signal.entryPrice;
     let worstAgainstTime = signal.worstAgainstTime ?? null;
     relevant.forEach((c) => {
-      if (signal.direction === 'ABOVE') {
+      if (signal.direction === 'UP') {
         if (c.low < worstAgainstEntry) {
           worstAgainstEntry = c.low;
           worstAgainstTime = c.time;
@@ -56,7 +58,7 @@ async function checkOpenBinary(signal) {
       const priceAt = findPriceNear(relevant, targetTime);
       if (!priceAt) continue;
 
-      const actualDirection = priceAt.close >= signal.entryPrice ? 'ABOVE' : 'BELOW';
+      const actualDirection = priceAt.close >= signal.entryPrice ? 'UP' : 'DOWN';
       const correct = actualDirection === cp.direction;
       // eslint-disable-next-line no-await-in-loop
       await binaryStore.recordCheckpointOutcome(cp.fraction, correct);
@@ -70,8 +72,8 @@ async function checkOpenBinary(signal) {
     if (expired) {
       const finalOutcome = resolvedCheckpoints[finalCp.fraction];
       const wentAgainstThenRecovered =
-        (signal.direction === 'ABOVE' && worstAgainstEntry < signal.entryPrice && finalOutcome.correct) ||
-        (signal.direction === 'BELOW' && worstAgainstEntry > signal.entryPrice && finalOutcome.correct);
+        (signal.direction === 'UP' && worstAgainstEntry < signal.entryPrice && finalOutcome.correct) ||
+        (signal.direction === 'DOWN' && worstAgainstEntry > signal.entryPrice && finalOutcome.correct);
 
       let nearMissNote = null;
       if (wentAgainstThenRecovered && worstAgainstTime) {
@@ -80,7 +82,7 @@ async function checkOpenBinary(signal) {
         nearMissNote =
           `Trade ke ${secondsIn} second baad price ${worstAgainstEntry} tak chali gayi thi ` +
           `(entry se ${movePct}%) - agar us waqt expiry hoti to loss hota, lekin final expiry tak ` +
-          `price wapas ${signal.direction === 'ABOVE' ? 'upar' : 'neeche'} aa gayi.`;
+          `price wapas ${signal.direction === 'UP' ? 'upar' : 'neeche'} aa gayi.`;
       }
 
       await binaryStore.close(signal.id, {
@@ -93,6 +95,51 @@ async function checkOpenBinary(signal) {
         nearMissNote,
         resolvedCheckpoints,
       });
+
+      // ---- Feed the real outcome back into calibration + performance
+      // tracking. This is what turns "raw model probability" into
+      // something that gets checked against reality over time, and what
+      // powers the per-expiry / per-regime accuracy reporting. Every
+      // closed trade updates exactly one calibration bucket (its own
+      // expiry bucket x its own raw-probability bin) - never mixed with
+      // other expiries or other probability ranges.
+      try {
+        const expiryBucketKey = signal.expiryBucket?.key
+          || expiryBucketsSvc.getExpiryBucket(signal.durationMinutes).key;
+        const regimeLabel = signal.regime?.label;
+        const correct = finalOutcome.correct;
+        if (Number.isFinite(signal.rawProbability)) {
+          await calibrationSvc.recordCalibrationOutcome(expiryBucketKey, signal.rawProbability, correct);
+        }
+        await calibrationSvc.recordExpiryPerf(expiryBucketKey, correct);
+        if (regimeLabel) {
+          await calibrationSvc.recordRegimePerf(regimeLabel, correct);
+          await calibrationSvc.recordExpiryRegimePerf(expiryBucketKey, regimeLabel, correct);
+        }
+        if (signal.session?.session) {
+          await calibrationSvc.recordSessionPerf(signal.session.session, correct);
+        }
+        // Feature-importance tracking (#16): each known boolean feature
+        // flag gets its OWN outcome key ("<flag>:true" / "<flag>:false"),
+        // so getAllFeaturePerf() can later show real win rate WITH vs.
+        // WITHOUT each feature - e.g. was a volume-confirmed breakout
+        // actually better than an unconfirmed one, in this bot's own
+        // history, not by theoretical assumption.
+        if (signal.featureFlags) {
+          for (const [flag, value] of Object.entries(signal.featureFlags)) {
+            if (typeof value === 'boolean') {
+              // eslint-disable-next-line no-await-in-loop
+              await calibrationSvc.recordFeatureOutcome(`${flag}:${value}`, correct);
+            }
+          }
+        }
+      } catch (calibErr) {
+        // Never let calibration bookkeeping failures block closing the
+        // trade itself - the WIN/LOSS record above is the source of
+        // truth; calibration just re-derives from it.
+        logger.error(`Calibration update failed for ${signal.id}: ${calibErr.message}`);
+      }
+
       logger.info(`Binary signal ${signal.id} closed: ${finalOutcome.correct ? 'WIN' : 'LOSS'}`);
       return;
     }
