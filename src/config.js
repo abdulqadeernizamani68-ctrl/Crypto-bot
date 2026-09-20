@@ -66,25 +66,46 @@ module.exports = {
   // "parameter/version tracking" requirement.
   analyticsVersion: 'binary-engine-v3',
 
-  // ---- AI provider (independent second analyst - see services/ai/) ----
-  // Never hard-code a key here; everything comes from the environment.
-  // AI_PROVIDER selects the implementation (see services/ai/provider.js);
-  // only 'gemini' exists today, but the abstraction is provider-agnostic
-  // so a second one can be added without touching the analyst/comparison
-  // code that calls it.
+  // ---- AI provider (independent analyst + final synthesis - see services/ai/) ----
+  // Never hard-code a key or a model here; everything comes from the
+  // environment. AI_PROVIDER selects the implementation (see
+  // services/ai/provider.js); only 'gemini' exists today, but the
+  // abstraction is provider-agnostic so a second one can be added without
+  // touching the analyst/comparison code that calls it.
   ai: {
     provider: (process.env.AI_PROVIDER || 'gemini').toLowerCase(),
     gemini: {
       apiKey: process.env.GEMINI_API_KEY || '',
-      model: process.env.GEMINI_MODEL || 'gemini-2.0-flash',
+      // Deliberately NO default model: Gemini model ids get deprecated, and
+      // a hard-coded default silently turns into a 404 the day that
+      // happens. Set GEMINI_MODEL to a currently supported model id. With
+      // it unset, the AI stages report "unavailable (GEMINI_MODEL is not
+      // set)" instead of calling a stale model - the deterministic bot
+      // analysis is unaffected.
+      model: (process.env.GEMINI_MODEL || '').trim(),
       baseUrl: process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta',
-      timeoutMs: num(process.env.GEMINI_TIMEOUT_MS, 15000),
+      // Per HTTP attempt. A !market run makes two sequential-in-effect
+      // Gemini calls (independent analysis, then final synthesis) and users
+      // are expected to wait 30s-2min, so this is far more generous than
+      // the old 15s single-call default.
+      timeoutMs: num(process.env.GEMINI_TIMEOUT_MS, 60000),
       maxRetries: num(process.env.GEMINI_MAX_RETRIES, 1),
+      // Newer Gemini models count internal "thinking" tokens against this
+      // cap, so a small value can leave no room for the JSON answer itself.
+      maxOutputTokens: num(process.env.GEMINI_MAX_OUTPUT_TOKENS, 4096),
     },
-    // How long a completed analysis is kept in short-lived conversation
-    // memory (services/analysisMemory.js) so a follow-up like "explain in
-    // Roman Urdu" doesn't need a fresh market-data fetch or a fresh AI
-    // call. Minutes.
+    // Only read by services/analysisMemory.js (the older Redis-backed
+    // follow-up memory). The unified !market workflow does NOT depend on it
+    // - see commands/market.js.
     memoryTtlMinutes: num(process.env.AI_MEMORY_TTL_MIN, 15),
+  },
+
+  // ---- Unified !market research workflow (services/marketWorkflow.js) ----
+  market: {
+    // Hard ceiling for one whole !market run (data fetch + bot + independent
+    // AI + final synthesis). When it is hit, in-flight Gemini calls are
+    // aborted and whatever finished is reported honestly (or a concise
+    // timeout state if nothing did).
+    workflowTimeoutMs: num(process.env.MARKET_WORKFLOW_TIMEOUT_MS, 120000),
   },
 };
