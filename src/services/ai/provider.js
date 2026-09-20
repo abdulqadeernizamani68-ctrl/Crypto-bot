@@ -1,9 +1,17 @@
 // ---- AI provider abstraction ----
 // A provider is any object shaped like:
 //
-//   async analyze({ context: object, language: 'en'|'roman-urdu'|'urdu' })
+//   async analyze({ context: object, language: 'en'|'roman-urdu'|'urdu',
+//                   kind: 'independent'|'synthesis', signal?: AbortSignal })
 //     -> { text: string|null, usage: object|null, finishReason: string|null, blocked: boolean }
 //
+//   - `kind` selects which prompt the provider builds (prompt.js): the
+//     blind 'independent' market analysis (raw candles in), or the 'final
+//     synthesis' that compares the two finished analyses. Defaults to
+//     'independent'.
+//   - `signal` (optional AbortSignal) lets the workflow cancel an in-flight
+//     call when its overall deadline is reached; a cancelled call throws an
+//     error with `.isTimeout = true`.
 //   - Throws on transport/HTTP failure (timeout, network, non-2xx). The
 //     thrown error may carry `.isTimeout` and/or `.isRateLimit` booleans
 //     so callers can react without string-matching.
@@ -36,10 +44,22 @@ function getProvider(nameOverride) {
   return provider;
 }
 
-function isConfigured(nameOverride) {
+// Returns null when the provider is ready to use, otherwise a short human-
+// readable reason (surfaced verbatim in the "AI unavailable" state - so a
+// missing GEMINI_MODEL is reported as exactly that instead of turning into
+// an opaque 404 from the API).
+function getConfigProblem(nameOverride) {
   const name = (nameOverride || config.ai.provider || 'gemini').toLowerCase();
-  if (name === 'gemini') return !!config.ai.gemini.apiKey;
-  return false;
+  if (name === 'gemini') {
+    if (!config.ai.gemini.apiKey) return 'GEMINI_API_KEY is not set';
+    if (!config.ai.gemini.model) return 'GEMINI_MODEL is not set (set it to a currently supported Gemini model id)';
+    return null;
+  }
+  return `unknown AI provider "${name}"`;
 }
 
-module.exports = { getProvider, isConfigured, PROVIDERS };
+function isConfigured(nameOverride) {
+  return getConfigProblem(nameOverride) === null;
+}
+
+module.exports = { getProvider, isConfigured, getConfigProblem, PROVIDERS };
