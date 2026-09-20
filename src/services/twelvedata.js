@@ -30,14 +30,31 @@ async function getTimeSeries(symbol, interval = '1min', outputsize = 120) {
     throw new Error(`Twelve Data error for ${symbol}: ${data.message || 'no values returned'}`);
   }
   // Twelve Data returns most-recent-first; reverse to chronological (oldest -> newest).
+  // Volume: Twelve Data includes a `volume` field for crypto and some
+  // equities, but forex/FX pairs have no centralized volume and the field
+  // is typically absent or 0 for them. We do NOT invent a number when it's
+  // missing - each candle's volume is `null` unless the provider returned
+  // a genuine positive value, and src/services/volume.js checks candle
+  // volume presence itself before computing anything from it (see its
+  // "AVAILABLE HONESTY NOTE"). A literal 0 is kept distinct from "missing"
+  // where the field was present (some venues can legitimately report a
+  // zero-volume bar); only an absent/non-numeric field becomes `null`.
   return data.values
-    .map((v) => ({
-      time: new Date(v.datetime).getTime(),
-      open: parseFloat(v.open),
-      high: parseFloat(v.high),
-      low: parseFloat(v.low),
-      close: parseFloat(v.close),
-    }))
+    .map((v) => {
+      let volume = null;
+      if (v.volume !== undefined && v.volume !== null && v.volume !== '') {
+        const parsedVol = Number(v.volume);
+        if (Number.isFinite(parsedVol) && parsedVol >= 0) volume = parsedVol;
+      }
+      return {
+        time: new Date(v.datetime).getTime(),
+        open: parseFloat(v.open),
+        high: parseFloat(v.high),
+        low: parseFloat(v.low),
+        close: parseFloat(v.close),
+        volume,
+      };
+    })
     .reverse();
 }
 
