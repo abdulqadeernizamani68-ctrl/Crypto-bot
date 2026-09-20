@@ -43,5 +43,48 @@ module.exports = {
     // always computed fresh from live volatility + drift, never hardcoded.
     highTrustThreshold: num(process.env.BINARY_HIGH_TRUST_THRESHOLD, 90),
     lookbackMinutesForStats: num(process.env.BINARY_LOOKBACK_MIN, 120),
+
+    // ---- NO_TRADE gates (see decideFinalSignal in binaryEngine.js) ----
+    // Calibrated probability must be at least 50 + this many points before
+    // a direction is actually issued instead of NO_TRADE. E.g. 5 means the
+    // calibrated edge must be >=55%.
+    noTradeEdgeThresholdPct: num(process.env.BINARY_NO_TRADE_EDGE_PCT, 5),
+    // Minimum number of usable (non-null) confluence indicators before the
+    // read is trusted at all.
+    minConfluenceFactors: num(process.env.BINARY_MIN_CONFLUENCE_FACTORS, 3),
+    // Fraction of the calibrated edge stripped away when the higher-
+    // timeframe confluence disagrees with the native-timeframe one (only
+    // applied for expiries >=10 minutes, where a higher timeframe is
+    // actually computed). 0.4 = lose 40% of the distance from 50%.
+    mtfDisagreementPenalty: num(process.env.BINARY_MTF_DISAGREEMENT_PENALTY, 0.4),
+  },
+
+  // Bumped whenever the deterministic engine's scoring/gating logic
+  // changes in a way that would make old backtest/calibration results not
+  // directly comparable to new ones - stored on every analysis record
+  // (see analysisLog.js) and shown in backtest output, per the
+  // "parameter/version tracking" requirement.
+  analyticsVersion: 'binary-engine-v3',
+
+  // ---- AI provider (independent second analyst - see services/ai/) ----
+  // Never hard-code a key here; everything comes from the environment.
+  // AI_PROVIDER selects the implementation (see services/ai/provider.js);
+  // only 'gemini' exists today, but the abstraction is provider-agnostic
+  // so a second one can be added without touching the analyst/comparison
+  // code that calls it.
+  ai: {
+    provider: (process.env.AI_PROVIDER || 'gemini').toLowerCase(),
+    gemini: {
+      apiKey: process.env.GEMINI_API_KEY || '',
+      model: process.env.GEMINI_MODEL || 'gemini-2.0-flash',
+      baseUrl: process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta',
+      timeoutMs: num(process.env.GEMINI_TIMEOUT_MS, 15000),
+      maxRetries: num(process.env.GEMINI_MAX_RETRIES, 1),
+    },
+    // How long a completed analysis is kept in short-lived conversation
+    // memory (services/analysisMemory.js) so a follow-up like "explain in
+    // Roman Urdu" doesn't need a fresh market-data fetch or a fresh AI
+    // call. Minutes.
+    memoryTtlMinutes: num(process.env.AI_MEMORY_TTL_MIN, 15),
   },
 };
