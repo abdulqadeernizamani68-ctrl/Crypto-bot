@@ -6,11 +6,12 @@ const config = require('./config');
 const logger = require('./utils/logger');
 const { handleBinaryCommand } = require('./commands/binary');
 const { handleBinaryAccuracyCommand } = require('./commands/binaryAccuracy');
+const { handleMarketCommand } = require('./commands/market');
 const { runBinaryTrackerCycle } = require('./services/binaryTracker');
 
 let clientInstance = null;
 
-async function routeCommand(text) {
+async function routeCommand(text, scopeId) {
   const trimmed = text.trim();
   if (/^!binaryaccuracy\b/i.test(trimmed)) {
     return handleBinaryAccuracyCommand();
@@ -18,6 +19,15 @@ async function routeCommand(text) {
   if (/^!binary\b/i.test(trimmed)) {
     const arg = trimmed.replace(/^!binary\s*/i, '');
     return handleBinaryCommand(arg);
+  }
+  // !market is the natural-language entry point (section N): everything
+  // after the prefix is parsed by services/nlu.js, not matched against
+  // more regexes here - "!market EURUSD analyse karo", "!market Roman
+  // Urdu mein explain karo", "!market sirf differences batao" all route
+  // here and get disambiguated by the parser.
+  if (/^!market\b/i.test(trimmed)) {
+    const arg = trimmed.replace(/^!market\s*/i, '');
+    return handleMarketCommand(scopeId, arg);
   }
   return null;
 }
@@ -45,7 +55,10 @@ function startDiscordBot() {
 
     logger.info(`Command from ${message.author.tag}: ${text}`);
     try {
-      const reply = await routeCommand(text);
+      // scopeId scopes conversation memory (services/analysisMemory.js) to
+      // this Discord channel - a follow-up like "explain in Roman Urdu"
+      // in the same channel reuses that channel's last analysis.
+      const reply = await routeCommand(text, message.channel.id);
       if (reply) {
         await message.reply(reply);
       }
