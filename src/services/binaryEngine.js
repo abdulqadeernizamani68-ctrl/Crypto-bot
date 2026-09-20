@@ -7,40 +7,87 @@
 // shows for *non-OTC* pairs during real market hours. Treat every output as
 // an estimate on the real underlying asset, not a guarantee of what Quotex's
 // OTC price will do. Fixed 1-5 minute expiries are close to a random walk -
-// no legitimate method reaches genuine, reliable 90%+ edge on those; when
-// this engine reports a high number, it means the *math it computed* came
-// out high, not that the trade is a sure thing.
+// no legitimate method reaches genuine, reliable 90%+ edge on those.
+//
+// ---- WHAT CHANGED IN THIS REDESIGN (read this before touching the math) ----
+// The old version computed one "confidence" number per signal and treated
+// it as gospel. This version separates several things that used to be
+// smushed together:
+//
+// 1. RAW PROBABILITY vs CALIBRATED PROBABILITY. The raw number
+//    (rawProbability) is still the normal-CDF output of the drift/vol
+//    random-walk model below - it is NOT a claim about historical accuracy,
+//    it's just "what the math says". calibratedProbability
+//    (src/services/calibration.js) is a separate number, pulled from what
+//    THIS bucket of raw probability has actually resolved to in real closed
+//    trades for THIS expiry length. The two are shown separately everywhere
+//    - never presented as if they're the same thing.
+//
+// 2. EXPIRY-DEPENDENT MODELING. A 1-minute trade and a 60-minute trade are
+//    no longer just the same drift extrapolated further:
+//    - the confluence read blends in a higher-timeframe (5m/15m resampled)
+//      confluence for expiries >=10 minutes, weighted more heavily the
+//      longer the expiry (computeMultiTimeframeConfluence) - short expiries
+//      stay native-timeframe only
+//    - calibration is looked up per expiry bucket (expiryBuckets.js), so a
+//      70% raw reading on a 1-minute trade and a 70% raw reading on a
+//      60-minute trade are calibrated against their OWN separate track
+//      records, never pooled
+//    - drift decay (unchanged from before) already stops confidence from
+//      mechanically climbing just because duration grew
+//
+// 3. MARKET REGIME (src/services/regime.js) - trending / ranging /
+//    breakout / reversal / unstable, crossed with a volatility axis. Used
+//    as a genuine gate: UNSTABLE readings push toward NO TRADE regardless
+//    of what the probability math says, because the inputs feeding that
+//    math (drift/vol/candles) are themselves untrustworthy in that state.
+//
+// 4. THREE-STATE OUTPUT: UP / DOWN / NO_TRADE. A weak edge, an unstable
+//    regime, too few usable indicators, or a duration far beyond what the
+//    recent data window can speak to all resolve to NO_TRADE rather than a
+//    forced direction. See decideFinalSignal() below for the exact gates.
+//
+// 5. GROUPED CONFLUENCE, NOT VOTE-COUNTING. EMA stack + MACD are both
+//    trend-following and highly correlated - they're now averaged into one
+//    TREND group instead of counted as two independent "votes". Same for
+//    RSI + Stochastic (MOMENTUM group). Market structure + S/R proximity +
+//    breakout/retest are grouped as PRICE_ACTION. Bollinger %B stands alone
+//    as MEAN_REVERSION. The four GROUPS are combined with fixed weights,
+//    not the raw factor count - so five correlated trend indicators
+//    agreeing no longer outweighs one genuine price-structure read just
+//    because there are more of them.
 //
 // ---- HOW THE PROBABILITY IS ACTUALLY COMPUTED (no hardcoded odds) ----
 // 1. Pull recent 1-minute closes and compute the log-return mean (drift) and
 //    standard deviation (volatility) *per minute*, measured fresh every call
 //    from real recent price action (config.binary.lookbackMinutesForStats).
-// 2. Nudge that drift slightly using a short-term technical tilt (EMA9/EMA21
-//    cross + RSI7), bounded to a fraction of the *measured* volatility so it
-//    can't manufacture a signal out of nothing.
+// 2. Nudge that drift using the grouped confluence tilt above, bounded to a
+//    fraction of the *measured* volatility so it can't manufacture a signal
+//    out of nothing.
 // 3. Model the log-price at any future time t as approximately Normal with
 //    mean = drift*t and stdev = volatility*sqrt(t) (standard random-walk
 //    diffusion assumption). The probability that price finishes above entry
 //    is the Normal CDF of that distribution evaluated at 0.
 // This is why longer horizons naturally get less extreme probabilities
-// (uncertainty grows with sqrt(t)) and why a strong recent trend can look
-// confident on a 1-minute check but fade out on a 30-minute one - that's the
-// model being honest about compounding uncertainty, not a bug.
+// (uncertainty grows with sqrt(t)).
 
 const config = require('../config');
 const indicators = require('./indicators');
 const twelvedata = require('./twelvedata');
 const logger = require('../utils/logger');
 const structureSvc = require('./structure');
+const regimeSvc = require('./regime');
+const calibrationSvc = require('./calibration');
+const expiryBucketsSvc = require('./expiryBuckets');
+const volumeSvc = require('./volume');
+const candleQualitySvc = require('./candleQuality');
+const divergenceSvc = require('./divergence');
+const sessionsSvc = require('./sessions');
+const dataQualitySvc = require('./dataQuality');
 
 function normalCdf(x) {
-  // CRITICAL FIX: the previous version had an extra "return 1 - prob"
-  // after already flipping prob for x>0 - a double-flip that inverted the
-  // result whenever |x| was large (i.e. whenever the signal was actually
-  // confident). That meant ABOVE/BELOW was often backwards exactly when it
-  // mattered most. Verified against known values: normalCdf(0) = 0.5,
-  // normalCdf(2) ≈ 0.977, normalCdf(-2) ≈ 0.023 - all correct with this
-  // version; the old version returned the flipped complement for |x| > 0.
+  // Verified against known values: normalCdf(0) = 0.5, normalCdf(2) ≈ 0.977,
+  // normalCdf(-2) ≈ 0.023.
   const t = 1 / (1 + 0.2316419 * Math.abs(x));
   const d = 0.3989423 * Math.exp((-x * x) / 2);
   let prob = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
@@ -74,9 +121,12 @@ function stdev(arr, m) {
   return Math.sqrt(variance);
 }
 
+function clamp(v, lo, hi) {
+  return Math.max(lo, Math.min(hi, v));
+}
+
 // How far price can be from a support/resistance level to still count as
-// "near" it, as a % of price. Not a magic number - it's just the window
-// used to decide whether a level is currently relevant.
+// "near" it, as a % of price.
 const SR_PROXIMITY_PCT = 0.15;
 
 function srProximityScore(entryPrice, nearest) {
@@ -84,7 +134,7 @@ function srProximityScore(entryPrice, nearest) {
   if (nearest.resistance) {
     const distPct = ((nearest.resistance.price - entryPrice) / entryPrice) * 100;
     if (distPct >= 0 && distPct < SR_PROXIMITY_PCT) {
-      const strength = Math.min(1, nearest.resistance.touches / 3); // more touches = more reliable level
+      const strength = Math.min(1, nearest.resistance.touches / 3);
       score -= 0.5 + 0.5 * strength * (1 - distPct / SR_PROXIMITY_PCT);
     }
   }
@@ -98,34 +148,38 @@ function srProximityScore(entryPrice, nearest) {
   return Math.max(-1, Math.min(1, score));
 }
 
-// Multi-factor confluence, bounded to [-1, 1]. Everything here is computed
-// LOCALLY from the same 1-minute candles already fetched for this signal -
-// zero extra Twelve Data API calls. The free plan's 8-calls/minute,
-// 800/day budget is spent entirely on the 2 calls this function's caller
-// already makes (candle history + live price); adding more factors costs
-// nothing extra as long as they're derived from that same candle array
-// rather than fetched separately.
+// ---- Grouped confluence ----
+// Each factor still gets its own [-1,1] score (for the transparency
+// breakdown shown to the user), but factors are combined WITHIN their
+// group first (correlated factors averaged, not stacked), and only then
+// are the (uncorrelated-ish) GROUP scores combined with fixed weights.
+// This is what stops "5 trend indicators all agree" from silently
+// outweighing "1 genuine price-structure read".
 //
-// Factor choice (standard TA practice, not ad-hoc):
-// - EMA9/21/50 stack + MACD histogram -> trend direction
-// - RSI(7) + Stochastic(14,3) -> momentum, tuned fast since durations here
-//   are mostly minutes, not days
-// - Bollinger %B -> mean-reversion pressure at price extremes, which
-//   matters more the shorter the duration (an overextended move often
-//   snaps back within a few minutes, before a short expiry)
-// - Market structure (swing HH/HL vs LH/LL) + Support/Resistance proximity
-//   + Breakout/Retest - genuine price-action read, not just indicators
-// - ADX(14) as a trend-strength GATE: the trend components (EMA, MACD) are
-//   down-weighted when ADX shows a weak/choppy market, since
-//   trend-following signals are least reliable exactly when there's no
-//   real trend to follow.
-//
-// Honesty note: liquidity / order-book depth is NOT included here. Twelve
-// Data (the forex/binary data source this bot uses) does not expose
-// order-book data for these pairs the way an exchange like Binance does -
-// there is no real liquidity data available to analyze, so this doesn't
-// pretend to have one.
-function buildConfluence(candles, structureInfo, srScore, breakoutScore) {
+// VOLUME / DIVERGENCE / CANDLE_QUALITY are intentionally the three
+// smallest weights - per the requirement, none of them is allowed to
+// become a standalone signal. They're real inputs (their group score is
+// computed for real, from real data, and IS part of the tilt), just
+// deliberately modest ones. All group weights are auto-renormalized by
+// how much weight was actually usable (see `weightUsed` below), so a
+// forex pair with no volume data simply redistributes VOLUME's weight
+// across the groups that DID have data - it never silently zeroes out
+// part of the read.
+const GROUP_WEIGHTS = {
+  TREND: 0.30,
+  MOMENTUM: 0.17,
+  MEAN_REVERSION: 0.12,
+  PRICE_ACTION: 0.24,
+  VOLUME: 0.08,
+  DIVERGENCE: 0.06,
+  CANDLE_QUALITY: 0.03,
+};
+
+// `extras` (all optional): { volumeState, divergences, candleQuality } -
+// each already-computed by their own dedicated service (volume.js,
+// divergence.js, candleQuality.js) so this function stays a pure combiner,
+// not a place where new detection logic gets invented.
+function buildConfluence(candles, structureInfo, srScore, breakoutScore, extras = {}) {
   const ema9 = indicators.ema(candles, 9);
   const ema21 = indicators.ema(candles, 21);
   const ema50 = indicators.ema(candles, 50);
@@ -136,20 +190,17 @@ function buildConfluence(candles, structureInfo, srScore, breakoutScore) {
   const adxVal = indicators.adx(candles, 14);
 
   // 0 at ADX<=15 (no real trend - chop), 1 at ADX>=30 (strong trend).
-  // Unknown/insufficient data -> 0.5 (neutral trust), so this never fully
-  // silences the trend components just because ADX couldn't be computed.
   const adxStrength = adxVal && Number.isFinite(adxVal.adx)
     ? Math.max(0, Math.min(1, (adxVal.adx - 15) / 15))
     : 0.5;
 
-  let tilt = 0;
-  let weight = 0;
-  const breakdown = [];
-  function add(factor, score, w = 1) {
+  const factors = []; // flat list, for the transparency breakdown only
+  const groups = { TREND: [], MOMENTUM: [], MEAN_REVERSION: [], PRICE_ACTION: [], VOLUME: [], DIVERGENCE: [], CANDLE_QUALITY: [] };
+
+  function record(group, factor, score) {
     if (score == null || !Number.isFinite(score)) return;
-    tilt += score * w;
-    weight += w;
-    breakdown.push({ factor, score: Number(score.toFixed(2)) });
+    factors.push({ factor, group, score: Number(score.toFixed(2)) });
+    groups[group].push(score);
   }
 
   if (ema9 != null && ema21 != null && ema50 != null) {
@@ -158,65 +209,73 @@ function buildConfluence(candles, structureInfo, srScore, breakoutScore) {
     else if (ema9 < ema21 && ema21 < ema50) emaScore = -1;
     else if (ema9 > ema21) emaScore = 0.5;
     else if (ema9 < ema21) emaScore = -0.5;
-    add('EMA trend stack', emaScore * adxStrength);
+    record('TREND', 'EMA trend stack', emaScore * adxStrength);
   }
-
   if (macdVal && Number.isFinite(macdVal.histogram)) {
     const macdScore = macdVal.histogram > 0 ? 1 : macdVal.histogram < 0 ? -1 : 0;
-    add('MACD', macdScore * adxStrength);
+    record('TREND', 'MACD', macdScore * adxStrength);
   }
 
   if (rsi7 != null) {
-    add('RSI(7)', Math.max(-1, Math.min(1, (rsi7 - 50) / 25)));
+    record('MOMENTUM', 'RSI(7)', Math.max(-1, Math.min(1, (rsi7 - 50) / 25)));
   }
-
   if (stoch && Number.isFinite(stoch.k) && Number.isFinite(stoch.d)) {
     let stochScore = Math.max(-1, Math.min(1, (stoch.k - 50) / 40));
-    // Classic stochastic reversal cue: %K crossing %D from an extreme zone.
     if (stoch.k < 20 && stoch.k > stoch.d) stochScore = Math.max(stochScore, 0.6);
     if (stoch.k > 80 && stoch.k < stoch.d) stochScore = Math.min(stochScore, -0.6);
-    add('Stochastic', stochScore);
+    record('MOMENTUM', 'Stochastic', stochScore);
   }
 
   if (bb && Number.isFinite(bb.upper) && Number.isFinite(bb.lower) && bb.upper > bb.lower) {
     const lastClose = candles[candles.length - 1].close;
     const percentB = (lastClose - bb.lower) / (bb.upper - bb.lower);
-    // Mean-reversion read, deliberately inverted from momentum: above the
-    // upper band leans bearish (expect pullback), below the lower band
-    // leans bullish.
     let bbScore = 0;
     if (percentB > 1) bbScore = -Math.min(1, (percentB - 1) * 2 + 0.5);
     else if (percentB < 0) bbScore = Math.min(1, -percentB * 2 + 0.5);
-    else bbScore = (0.5 - percentB) * 0.6; // mild pull toward the mean even inside the bands
-    add('Bollinger %B', bbScore);
+    else bbScore = (0.5 - percentB) * 0.6;
+    record('MEAN_REVERSION', 'Bollinger %B', bbScore);
   }
 
-  add('Market structure', structureInfo.score);
-  add('Support/Resistance', srScore);
-  add('Breakout/Retest', breakoutScore);
+  record('PRICE_ACTION', 'Market structure', structureInfo.score);
+  record('PRICE_ACTION', 'Support/Resistance', srScore);
+  record('PRICE_ACTION', 'Breakout/Retest', breakoutScore);
+
+  // Volume, divergence, candle-quality: each ONLY contributes when its own
+  // service determined it had real data to work with (`available`/a
+  // non-empty divergence list) - never faked, never defaulted to neutral
+  // just to fill the group (an empty group is simply left out of `groups`,
+  // which the weightUsed normalization below already handles correctly).
+  if (extras.volumeState && extras.volumeState.available) {
+    record('VOLUME', 'Price-Volume relationship', extras.volumeState.confluenceScore);
+  }
+  if (extras.divergences && extras.divergences.length) {
+    record('DIVERGENCE', `Divergence (${extras.divergences.length} found)`, divergenceSvc.divergenceConfluenceScore(extras.divergences));
+  }
+  if (extras.candleQuality && extras.candleQuality.available) {
+    record('CANDLE_QUALITY', `Candle pattern (${extras.candleQuality.tags.join(', ') || 'neutral'})`, extras.candleQuality.confluenceScore);
+  }
+
+  let tilt = 0;
+  let weightUsed = 0;
+  const groupScores = {};
+  for (const [group, scores] of Object.entries(groups)) {
+    if (!scores.length) continue;
+    const groupScore = clamp(mean(scores), -1, 1);
+    groupScores[group] = Number(groupScore.toFixed(2));
+    tilt += groupScore * GROUP_WEIGHTS[group];
+    weightUsed += GROUP_WEIGHTS[group];
+  }
 
   return {
-    tilt: weight > 0 ? Math.max(-1, Math.min(1, tilt / weight)) : 0,
-    breakdown: breakdown.sort((a, b) => Math.abs(b.score) - Math.abs(a.score)),
+    tilt: weightUsed > 0 ? clamp(tilt / weightUsed, -1, 1) : 0,
+    factorCount: factors.length,
+    groupScores,
+    breakdown: factors.sort((a, b) => Math.abs(b.score) - Math.abs(a.score)),
   };
 }
 
-// Current volatility vs its OWN recent history (percentile), not an
-// arbitrary fixed threshold - what's "high" for one pair on one day is
-// "normal" for another, so this always judges a pair against itself.
-function volatilityRegime(candles) {
-  const series = indicators.atrSeries(candles, 14).filter(Number.isFinite);
-  if (series.length < 20) return { regime: 'UNKNOWN', percentile: null };
-  const atrNow = series[series.length - 1];
-  const sorted = [...series].sort((a, b) => a - b);
-  const rank = sorted.findIndex((v) => v >= atrNow);
-  const percentile = Math.round((rank / sorted.length) * 100);
-  const regime = percentile <= 25 ? 'LOW' : percentile >= 75 ? 'HIGH' : 'NORMAL';
-  return { regime, percentile };
-}
-
-// Groups consecutive 1-minute candles into synthetic larger candles - pure
-// local math on data already fetched, no extra API call.
+// Compares the requested timeframe's own signal quality against 5-min and
+// 15-min resampled versions of the SAME candles (no extra API calls).
 function resampleCandles(candles, factor) {
   const out = [];
   for (let i = 0; i + factor <= candles.length; i += factor) {
@@ -232,10 +291,6 @@ function resampleCandles(candles, factor) {
   return out;
 }
 
-// Cheap proxy for "how clean/tradeable does this timeframe look right
-// now" - combines trend strength (ADX) with how clearly structured price
-// is (HH/HL or LH/LL vs mixed/choppy). Used only to compare timeframes
-// against each other, not as a standalone score.
 function confluenceQuality(candles) {
   if (candles.length < 30) return 0;
   const adxVal = indicators.adx(candles, 14);
@@ -244,11 +299,6 @@ function confluenceQuality(candles) {
   return (adxStrength + Math.abs(structureInfo.score)) / 2;
 }
 
-// Compares the requested timeframe's own signal quality against 5-min and
-// 15-min resampled versions of the SAME candles (no extra API calls).
-// Only suggests a change when another timeframe looks MEANINGFULLY
-// cleaner (not just marginally) - computed fresh every call from this
-// pair's actual current data, not a fixed rule.
 function suggestBetterTimeframe(candles) {
   const nativeQuality = confluenceQuality(candles);
   const candidates = [
@@ -267,103 +317,269 @@ function suggestBetterTimeframe(candles) {
   return best;
 }
 
-async function generateBinarySignal(symbolRaw, durationMinutes) {
-  const duration = Math.max(
-    config.binary.minDurationMinutes,
-    Math.min(config.binary.maxDurationMinutes, durationMinutes)
+// How many raw 1-minute candles are needed so the higher-timeframe resample
+// below actually has enough bars to compute a meaningful confluence read
+// (EMA50/MACD(26,9) need dozens of resampled bars, not just the technical
+// minimum of 1). Exported so the live fetch size and the backtester agree
+// on exactly the same requirement - otherwise the backtest could validate
+// a code path the live bot never actually reaches for lack of data.
+function mtfFactorFor(duration) {
+  if (duration >= 30) return 15;
+  if (duration >= 10) return 5;
+  return null;
+}
+
+function mtfCandlesNeeded(duration) {
+  const factor = mtfFactorFor(duration);
+  if (!factor) return 0;
+  // Aim for ~55-60 resampled bars - enough for EMA50 to actually produce a
+  // value most of the time, not just MACD/RSI.
+  const targetResampledBars = duration >= 30 ? 55 : 60;
+  return factor * targetResampledBars;
+}
+
+// ---- Multi-timeframe blend (expiry-dependent) ----
+// Short expiries (<10 min) trade purely on the native 1-minute confluence -
+// there usually isn't a higher-timeframe candle formed yet that's relevant
+// to a 3-minute decision. Longer expiries increasingly need a higher
+// timeframe to agree, because "what the last few 1-minute candles did" is
+// weak evidence about where price will be in 30-60 minutes.
+//
+// `fullCandles` here is deliberately allowed to be LONGER than the native
+// statsLookback window (see requiredFetchSize/computeSignalCore) - the
+// resample needs more raw history than the drift/vol stats do, and
+// stretching statsLookback itself to cover that would quietly change what
+// window drift/volatility get measured over. Keeping them separate means
+// "how far back drift is measured" and "how much history the higher
+// timeframe needs" are two different knobs, not one conflated one.
+function computeMultiTimeframeConfluence(fullCandles, duration, nativeConfluence, srScore, breakoutScore) {
+  const factor = mtfFactorFor(duration);
+  if (!factor) {
+    return { tilt: nativeConfluence.tilt, agreement: null, higherTF: null };
+  }
+  const resampled = resampleCandles(fullCandles, factor);
+  const MIN_RESAMPLED = 30;
+  if (resampled.length < MIN_RESAMPLED) {
+    return { tilt: nativeConfluence.tilt, agreement: null, higherTF: null };
+  }
+  const higherStructure = structureSvc.classifyStructure(resampled);
+  const higherConfluence = buildConfluence(resampled, higherStructure, srScore, breakoutScore);
+  const blendWeight = duration >= 30 ? 0.5 : 0.3;
+  const combinedTilt = clamp(
+    nativeConfluence.tilt * (1 - blendWeight) + higherConfluence.tilt * blendWeight,
+    -1,
+    1
   );
+  const NEAR_ZERO = 0.08;
+  const agreement =
+    Math.abs(nativeConfluence.tilt) < NEAR_ZERO || Math.abs(higherConfluence.tilt) < NEAR_ZERO
+      ? null // one side has no real opinion - not a disagreement, just uninformative
+      : Math.sign(nativeConfluence.tilt) === Math.sign(higherConfluence.tilt);
+  return {
+    tilt: combinedTilt,
+    agreement,
+    higherTF: { label: `${factor}min resampled`, tilt: Number(higherConfluence.tilt.toFixed(2)) },
+  };
+}
 
-  // Lookback scales with how far ahead we're forecasting (more history for
-  // a 48h trade than a 5-minute one), capped at 12h of 1-min candles to
-  // keep the API call and the stats window reasonable.
-  const statsLookback = Math.max(60, config.binary.lookbackMinutesForStats, Math.min(720, Math.ceil(duration * 1.5)));
+// ---- Final UP / DOWN / NO_TRADE decision ----
+// Every gate here is a plain, named reason - if none fire, the raw
+// direction from the probability math stands; if any fire, the signal
+// becomes NO_TRADE. This is deliberately conservative: it is fine to miss
+// a marginal setup, it is not fine to hand out a forced direction on a
+// setup the model itself can't vouch for.
+function decideFinalSignal({
+  rawDirection,
+  calibratedPct,
+  regimeInfo,
+  factorCount,
+  mtfAgreement,
+  duration,
+  statsLookback,
+  calibrationSampleSize,
+  dataQuality,
+  structureInfo,
+  breakoutInfo,
+  groupScores,
+}) {
+  const reasons = [];
 
-  // Fetch candle history AND the live quote at the same time (not one after
-  // the other) - candles took ~0.2-0.8s before this, and doing the live
-  // price fetch only after that finished meant entryPrice reflected a price
-  // from further in the past than necessary. Running them in parallel gets
-  // the live price as close to "right now" as this API call can give.
-  const [candles, livePriceResult] = await Promise.all([
-    twelvedata.getTimeSeries(symbolRaw, '1min', statsLookback),
-    twelvedata.getCurrentPrice(symbolRaw).catch((err) => {
-      logger.warn(`Live price fetch failed for ${symbolRaw}, will fall back to last candle close: ${err.message}`);
-      return null;
-    }),
-  ]);
-  if (candles.length < 30) {
-    throw new Error(`Not enough recent 1-minute data for ${symbolRaw} to analyze (got ${candles.length} candles)`);
+  // ---- Data quality gate (checked first - if the inputs are corrupt,
+  // nothing downstream can be trusted regardless of what it computed) ----
+  if (dataQuality && !dataQuality.ok) {
+    reasons.push(`data quality check failed (${dataQuality.issues.join('; ') || 'insufficient clean candles'})`);
+  }
+  if (structureInfo && structureInfo.pattern === 'INSUFFICIENT_DATA') {
+    reasons.push('not enough swing-point history to read market structure - missing critical data for this read');
   }
 
+  if (!regimeInfo.reliable) {
+    reasons.push(`market regime flagged UNSTABLE (${regimeInfo.reasons.join('; ')})`);
+  }
+  if (factorCount < config.binary.minConfluenceFactors) {
+    reasons.push(`only ${factorCount} usable indicator(s) - not enough for a reliable read (need ${config.binary.minConfluenceFactors}+)`);
+  }
+  if (
+    duration > statsLookback * 3 &&
+    calibrationSampleSize < calibrationSvc.MIN_SAMPLES_FOR_CONFIDENT_CALIBRATION
+  ) {
+    reasons.push(
+      `${formatMinutes(duration)} horizon is well beyond the ${formatMinutes(statsLookback)} data window this call measured, ` +
+      'and this expiry length does not yet have enough closed trades to have earned trust at that horizon'
+    );
+  }
+  if (mtfAgreement === false && duration >= 10) {
+    reasons.push('higher-timeframe context disagrees with the native-timeframe read');
+  }
+
+  // ---- Breakout quality: a FALSE breakout (broke the level, then closed
+  // back on the wrong side and never re-broke) is active evidence against
+  // the move, not just "unconfirmed" - hard-gated. An unconfirmed-but-not-
+  // false breakout is NOT hard-gated here (per the requirement that a
+  // breakout without confirmation shouldn't automatically be treated as
+  // high-confidence, but also shouldn't be treated as automatically
+  // disqualifying) - instead its contribution to the confluence tilt is
+  // already scaled down by its own `quality` score before it ever reaches
+  // this function (see computeSignalCore/breakoutContribScore below).
+  if (breakoutInfo && breakoutInfo.falseBreakout) {
+    reasons.push('most recent breakout has failed (price closed back on the wrong side without re-breaking) - false breakout');
+  }
+
+  // ---- Contradictory momentum: TREND and MOMENTUM groups pointing
+  // meaningfully opposite ways is a sign the setup lacks real agreement,
+  // even if the blended tilt happens to clear the edge threshold.
+  if (groupScores && Number.isFinite(groupScores.TREND) && Number.isFinite(groupScores.MOMENTUM)) {
+    const bothMeaningful = Math.abs(groupScores.TREND) > 0.35 && Math.abs(groupScores.MOMENTUM) > 0.35;
+    const opposite = Math.sign(groupScores.TREND) !== Math.sign(groupScores.MOMENTUM);
+    if (bothMeaningful && opposite) {
+      reasons.push(`trend (${groupScores.TREND}) and momentum (${groupScores.MOMENTUM}) indicators contradict each other`);
+    }
+  }
+
+  // ---- Weak/directionless structure in a genuinely ranging market - the
+  // one case where "no real price-action read" is itself informative
+  // rather than just a low factor count.
+  if (regimeInfo.primary === 'RANGING' && groupScores && Math.abs(groupScores.PRICE_ACTION || 0) < 0.15) {
+    reasons.push('market structure is weak/directionless inside a ranging regime - no reliable price-action read');
+  }
+
+  // Edge check last, using the (possibly mtf-penalized) calibrated
+  // probability - weak edge is the most common, least dramatic reason to
+  // sit out, so it's listed after the more specific structural reasons.
+  if (calibratedPct < 50 + config.binary.noTradeEdgeThresholdPct) {
+    reasons.push(
+      `calibrated edge (${calibratedPct.toFixed(1)}%) is inside the no-trade zone ` +
+      `(need >=${50 + config.binary.noTradeEdgeThresholdPct}%)`
+    );
+  }
+
+  return { direction: reasons.length ? 'NO_TRADE' : rawDirection, reasons };
+}
+
+// How many 1-minute candles to actually fetch/pass in: at least enough for
+// the drift/vol stats window (statsLookback), AND at least enough for the
+// higher-timeframe resample this duration calls for (mtfCandlesNeeded).
+// The two are different concerns (see computeMultiTimeframeConfluence) so
+// this is a max(), not a replacement of either.
+function requiredFetchSize(duration, statsLookback) {
+  return Math.max(statsLookback, mtfCandlesNeeded(duration));
+}
+
+// ---- Pure core: everything that can be computed from a candle array +
+// entry price + duration alone, with NO network calls and NO Redis/
+// calibration lookups. This is the exact same math the live path uses
+// (generateBinarySignal below just adds the data fetch and calibration on
+// top), and it's what the walk-forward backtester (src/backtest/run.js)
+// calls directly against historical candles - so a backtest result is
+// provably testing the same logic that runs live, not a re-implementation
+// that could quietly drift out of sync with it.
+//
+// `allCandles` may be LONGER than statsLookback (see requiredFetchSize) -
+// only the last `statsLookback` candles are used for drift/vol/native
+// structure/native confluence/regime, exactly like before this multi-
+// timeframe feature existed. The extra history at the front, if any, is
+// used ONLY by the higher-timeframe resample inside
+// computeMultiTimeframeConfluence, via the full `allCandles` array.
+function computeSignalCore(allCandlesRaw, entryPrice, duration, statsLookback) {
+  // ---- Data quality first: clean (dedupe/sort/drop-corrupt-bars) the
+  // FULL input before anything else touches it, so every downstream piece
+  // (native window, MTF resample) works off validated data. This runs
+  // identically live and in the backtester (pure function of the candle
+  // array), which is the point - a data-quality bug would otherwise show
+  // up differently in each.
+  const dq = dataQualitySvc.validateCandleSeries(allCandlesRaw);
+  const allCandles = dq.cleaned;
+
+  const candles = allCandles.length > statsLookback ? allCandles.slice(-statsLookback) : allCandles;
   const closes = candles.map((c) => c.close);
-  // Entry price: prefer the live quote fetched above over the last
-  // completed 1-minute candle close, which can be up to ~60s stale.
-  let entryPrice = closes[closes.length - 1];
-  if (Number.isFinite(livePriceResult) && livePriceResult > 0) entryPrice = livePriceResult;
   const rets = logReturns(closes.slice(-statsLookback));
   const driftPerMin = mean(rets);
   const volPerMin = stdev(rets, driftPerMin);
 
-  // Statistical-significance shrinkage: a drift estimated from a short,
-  // noisy window can have a sign that's essentially a coin flip rather than
-  // a real trend - e.g. mean(rets) is small and close to its own standard
-  // error. Without this, the direction can flip between two calls made
-  // seconds apart even though nothing meaningfully changed in the market.
-  // This shrinks the drift toward zero in proportion to how indistinguishable
-  // it is from noise (driftPerMin vs its standard error), so a genuinely
-  // weak/noisy signal pulls confidence back toward 50% instead of
-  // confidently asserting a random direction.
   const driftStdErr = rets.length > 1 ? volPerMin / Math.sqrt(rets.length) : volPerMin;
   const driftReliability = driftStdErr > 0
     ? (driftPerMin * driftPerMin) / (driftPerMin * driftPerMin + driftStdErr * driftStdErr)
     : 1;
   const reliableDrift = driftPerMin * driftReliability;
 
-  // Market structure, support/resistance and breakout/retest - all derived
-  // from the SAME candles already fetched above, zero extra API calls.
+  // ---- New research-grade inputs (each independently gated on having
+  // real data - see each service's own honesty note) ----
+  const volumeState = volumeSvc.computeVolumeState(candles);
+  const candleQuality = candleQualitySvc.analyzeLastCandle(candles);
+  const divergences = divergenceSvc.detectDivergences(candles, volumeState);
+  // Session is classified from the LAST CANDLE's own timestamp, not
+  // wall-clock "now" - this is what makes it work correctly inside the
+  // walk-forward backtester too (a backtest point pretending to be
+  // "January 3rd, 09:00 UTC" gets that session, not today's).
+  const session = sessionsSvc.classifySession(candles[candles.length - 1].time);
+
   const structureInfo = structureSvc.classifyStructure(candles);
-  const srLevels = structureSvc.findKeyLevels(candles);
+  const srLevelsRaw = structureSvc.findKeyLevels(candles);
+  const srLevels = structureSvc.enrichLevelsWithStrength(srLevelsRaw, candles, {
+    volumeState,
+    rangeVolumeConfirmed: volumeSvc.rangeVolumeConfirmed,
+  });
   const nearestSR = structureSvc.nearestLevels(entryPrice, srLevels);
   const srScore = srProximityScore(entryPrice, nearestSR);
-  const breakoutInfo = structureSvc.detectBreakoutRetest(candles, srLevels);
-  const volRegime = volatilityRegime(candles);
+  const breakoutInfo = structureSvc.analyzeBreakoutQuality(candles, srLevels, {
+    volumeState,
+    rangeVolumeConfirmed: volumeSvc.rangeVolumeConfirmed,
+    candleQualityFn: candleQualitySvc.analyzeLastCandle,
+    lookback: 15,
+  });
+  const regimeInfo = regimeSvc.classifyRegime(candles, structureInfo, breakoutInfo, volumeState);
   const timeframeSuggestion = suggestBetterTimeframe(candles);
 
-  const confluence = buildConfluence(candles, structureInfo, srScore, breakoutInfo.score);
-  const tilt = confluence.tilt;
-  // Tilt can shift drift by at most 1 stdev-per-minute worth - i.e. it can
-  // meaningfully lean the estimate but never override what volatility itself
-  // measured.
+  // A breakout's contribution to the confluence tilt is scaled by its own
+  // `quality` (0-1, from analyzeBreakoutQuality) - an unconfirmed/no-
+  // follow-through breakout still nudges the read, just much less than a
+  // fully-confirmed one. This is the concrete mechanism behind "a breakout
+  // without confirmation is not automatically a high-confidence setup".
+  const breakoutContribScore = breakoutInfo.type !== 'NONE'
+    ? breakoutInfo.score * (breakoutInfo.quality != null ? breakoutInfo.quality : 1)
+    : 0;
+
+  const nativeConfluence = buildConfluence(candles, structureInfo, srScore, breakoutContribScore, {
+    volumeState,
+    divergences,
+    candleQuality,
+  });
+  const mtf = computeMultiTimeframeConfluence(allCandles, duration, nativeConfluence, srScore, breakoutContribScore);
+  const tilt = mtf.tilt;
   const adjustedDrift = reliableDrift + tilt * volPerMin;
 
-  // Drift decay: the drift/tilt estimate above was measured over
-  // `statsLookback` minutes of recent data. Naively extrapolating it out to
-  // an arbitrary duration makes confidence climb toward 100% purely because
-  // duration grew (drift scales with t, volatility only with sqrt(t)) - not
-  // because the forecast actually got more reliable. This decays the
-  // drift's influence as the requested duration goes beyond the window it
-  // was measured over, so confidence stops being a near-mechanical function
-  // of duration and instead tapers back toward 50% for horizons the recent
-  // data genuinely can't speak to.
   function decayedDrift(t) {
     return adjustedDrift * (statsLookback / (statsLookback + t));
   }
 
   const checkpoints = config.binary.checkpointFractions.map((frac) => {
-    // Below 1 minute we keep a fractional t (in minutes) instead of forcing
-    // a whole-minute round-up - the math still works (sqrt-time scaling of
-    // 1-minute volatility), it's just extrapolating below the native
-    // resolution of the 1-minute candle data, so treat it as a rougher
-    // estimate than 1min+ durations.
     const t = duration >= 1 ? Math.max(1, Math.round(duration * frac)) : Math.max(1 / 60, duration * frac);
     const meanLogRet = decayedDrift(t) * t;
     const sdLogRet = volPerMin * Math.sqrt(t);
     const z = sdLogRet > 0 ? meanLogRet / sdLogRet : (meanLogRet > 0 ? 5 : meanLogRet < 0 ? -5 : 0);
     const probAbove = normalCdf(z);
-    const direction = probAbove >= 0.5 ? 'ABOVE' : 'BELOW';
-    const probability = direction === 'ABOVE' ? probAbove : 1 - probAbove;
-    // Point estimate + a rough range (±1 stdev of the log-return, ~68% of
-    // outcomes fall inside it) for how far price is expected to move by
-    // this checkpoint - not just the direction/probability.
+    const direction = probAbove >= 0.5 ? 'UP' : 'DOWN';
+    const probability = direction === 'UP' ? probAbove : 1 - probAbove;
     const predictedPrice = entryPrice * Math.exp(meanLogRet);
     const rangeLow = entryPrice * Math.exp(meanLogRet - sdLogRet);
     const rangeHigh = entryPrice * Math.exp(meanLogRet + sdLogRet);
@@ -380,30 +596,198 @@ async function generateBinarySignal(symbolRaw, durationMinutes) {
   });
 
   const finalCp = checkpoints[checkpoints.length - 1];
-  const confidence = finalCp.probabilityPct;
+
+  // Feature flags: a compact set of booleans, recorded against actual
+  // trade outcomes by binaryTracker.js via calibration.recordFeatureOutcome
+  // - this is what lets #16 "which features actually help" be answered
+  // from real data later (see getAllFeaturePerf), instead of assumed.
+  // Only set when genuinely knowable (null when not applicable/available).
+  const featureFlags = {
+    volume_available: volumeState.available,
+    volume_confirmed_breakout: breakoutInfo.type !== 'NONE' ? breakoutInfo.volumeConfirmed : null,
+    divergence_present: divergences.length > 0,
+    htf_ltf_agree: mtf.agreement,
+    breakout_high_quality: breakoutInfo.type !== 'NONE' && breakoutInfo.quality != null ? breakoutInfo.quality >= 0.6 : null,
+    candle_momentum_aligned: candleQuality.available
+      ? Math.sign(candleQuality.confluenceScore) === Math.sign(tilt) && Math.abs(candleQuality.confluenceScore) > 0.1
+      : null,
+  };
+
+  return {
+    driftPerMin,
+    volPerMin,
+    dataQuality: dq,
+    volumeState,
+    candleQuality,
+    divergences,
+    session,
+    structureInfo,
+    srLevels,
+    nearestSR,
+    breakoutInfo,
+    regimeInfo,
+    timeframeSuggestion,
+    nativeConfluence,
+    mtf,
+    tilt,
+    checkpoints,
+    finalCp,
+    featureFlags,
+    rawDirection: finalCp.direction,
+    rawProbability: finalCp.probabilityPct,
+  };
+}
+
+async function generateBinarySignal(symbolRaw, durationMinutes) {
+  const duration = Math.max(
+    config.binary.minDurationMinutes,
+    Math.min(config.binary.maxDurationMinutes, durationMinutes)
+  );
+
+  const statsLookback = Math.max(60, config.binary.lookbackMinutesForStats, Math.min(720, Math.ceil(duration * 1.5)));
+  const fetchSize = requiredFetchSize(duration, statsLookback);
+
+  const [candles, livePriceResult] = await Promise.all([
+    twelvedata.getTimeSeries(symbolRaw, '1min', fetchSize),
+    twelvedata.getCurrentPrice(symbolRaw).catch((err) => {
+      logger.warn(`Live price fetch failed for ${symbolRaw}, will fall back to last candle close: ${err.message}`);
+      return null;
+    }),
+  ]);
+  if (candles.length < 30) {
+    throw new Error(`Not enough recent 1-minute data for ${symbolRaw} to analyze (got ${candles.length} candles)`);
+  }
+
+  const closes = candles.map((c) => c.close);
+  let entryPrice = closes[closes.length - 1];
+  if (Number.isFinite(livePriceResult) && livePriceResult > 0) entryPrice = livePriceResult;
+
+  // Wall-clock staleness check - only meaningful live (see dataQuality.js
+  // header for why this is separate from the structural validation that
+  // also runs, identically, inside the backtester).
+  const nowMs = Date.now();
+  const staleness = dataQualitySvc.checkStaleness(candles, nowMs, 60000, 5);
+
+  const core = computeSignalCore(candles, entryPrice, duration, statsLookback);
+  const {
+    driftPerMin, volPerMin, dataQuality, volumeState, candleQuality, divergences, session,
+    structureInfo, srLevels, nearestSR, breakoutInfo, regimeInfo,
+    timeframeSuggestion, nativeConfluence, mtf, tilt, checkpoints, featureFlags, rawDirection, rawProbability,
+  } = core;
+
+  const expiryBucket = expiryBucketsSvc.getExpiryBucket(duration);
+  const calib = await calibrationSvc.calibrateProbability(rawProbability, expiryBucket.key);
+  let calibratedPct = calib.calibratedPct;
+
+  // Higher-timeframe disagreement (for expiries where that context was
+  // actually computed) shaves the edge back toward 50 rather than hard
+  // vetoing by itself - decideFinalSignal below is what turns a
+  // sufficiently-shaved edge into NO_TRADE via the standard edge check, so
+  // there's one consistent place the actual cutoff lives.
+  if (mtf.agreement === false && duration >= 10) {
+    calibratedPct = 50 + (calibratedPct - 50) * (1 - config.binary.mtfDisagreementPenalty);
+  }
+
+  const decision = decideFinalSignal({
+    rawDirection,
+    calibratedPct,
+    regimeInfo,
+    factorCount: nativeConfluence.factorCount,
+    mtfAgreement: mtf.agreement,
+    duration,
+    statsLookback,
+    calibrationSampleSize: calib.sampleSize,
+    dataQuality,
+    structureInfo,
+    breakoutInfo,
+    groupScores: nativeConfluence.groupScores,
+  });
+
+  // Staleness is a live-only safety net, applied AFTER the normal decision
+  // so its reason is additive rather than replacing whatever the model
+  // itself found - it can only push toward NO_TRADE, never away from it.
+  let finalDirection = decision.direction;
+  const noTradeReasons = [...decision.reasons];
+  if (staleness.stale && finalDirection !== 'NO_TRADE') {
+    finalDirection = 'NO_TRADE';
+    noTradeReasons.push(`live data looks stale (most recent candle is ~${staleness.ageBars} bars old) - not trading on it`);
+  }
+
+  // Quality label: a simple, transparent count of "things that are going
+  // right" - not itself a probability, just a quick trust signal for the UI.
+  let qualityScore = 0;
+  if (regimeInfo.reliable) qualityScore += 1;
+  if (!calib.lowConfidence) qualityScore += 1;
+  if (mtf.agreement !== false) qualityScore += 1;
+  if (nativeConfluence.factorCount >= 5) qualityScore += 1;
+  const qualityLabel = finalDirection === 'NO_TRADE'
+    ? 'NO_TRADE'
+    : qualityScore >= 3 ? 'HIGH' : qualityScore >= 2 ? 'MEDIUM' : 'LOW';
 
   return {
     symbol: symbolRaw.toUpperCase(),
     entryPrice,
     durationMinutes: duration,
-    direction: finalCp.direction,
-    confidence,
-    highTrust: confidence >= config.binary.highTrustThreshold,
+    expiryBucket,
+    direction: finalDirection, // 'UP' | 'DOWN' | 'NO_TRADE'
+    rawDirection, // what the math said before any gate, always UP/DOWN
+    noTradeReasons,
+    rawProbability,
+    calibratedProbability: Number(calibratedPct.toFixed(1)),
+    calibrationSampleSize: calib.sampleSize,
+    calibrationLowConfidence: calib.lowConfidence,
+    calibrationRecentWinRatePct: calib.recentWinRatePct,
+    calibrationRecentSampleSize: calib.recentSampleSize,
+    qualityLabel,
+    highTrust: finalDirection !== 'NO_TRADE' && calibratedPct >= config.binary.highTrustThreshold && qualityLabel === 'HIGH',
     driftPerMin,
     volPerMin,
     tilt,
-    confluenceBreakdown: confluence.breakdown,
+    confluenceBreakdown: nativeConfluence.breakdown,
+    confluenceGroupScores: nativeConfluence.groupScores,
+    confluenceGroupWeights: GROUP_WEIGHTS,
+    multiTimeframe: mtf.higherTF ? { ...mtf.higherTF, agreement: mtf.agreement } : null,
     structure: { pattern: structureInfo.pattern },
     supportResistance: {
-      support: nearestSR.support ? { price: nearestSR.support.price, touches: nearestSR.support.touches } : null,
-      resistance: nearestSR.resistance ? { price: nearestSR.resistance.price, touches: nearestSR.resistance.touches } : null,
+      support: nearestSR.support ? { price: nearestSR.support.price, touches: nearestSR.support.touches, strength: nearestSR.support.strength ?? null } : null,
+      resistance: nearestSR.resistance ? { price: nearestSR.resistance.price, touches: nearestSR.resistance.touches, strength: nearestSR.resistance.strength ?? null } : null,
     },
-    breakout: breakoutInfo.type !== 'NONE' ? { type: breakoutInfo.type, retested: breakoutInfo.retested } : null,
-    volatilityRegime: volRegime,
+    breakout: breakoutInfo.type !== 'NONE' ? {
+      type: breakoutInfo.type,
+      retested: breakoutInfo.retested,
+      quality: breakoutInfo.quality,
+      volumeConfirmed: breakoutInfo.volumeConfirmed,
+      falseBreakout: breakoutInfo.falseBreakout,
+      followThroughCandles: breakoutInfo.followThroughCandles,
+      distanceBeyondPct: breakoutInfo.distanceBeyondPct,
+    } : null,
+    volume: volumeState,
+    candleQuality,
+    divergences,
+    session,
+    regime: regimeInfo,
+    // Kept for backward-compatible display (formatting.js reads
+    // signal.volatilityRegime.regime / .percentile) - sourced from the
+    // same regime classification above rather than computed twice.
+    volatilityRegime: { regime: regimeInfo.volatility, percentile: regimeInfo.volatilityPercentile },
+    dataQualityIssues: dataQuality.issues,
+    featureFlags,
     timeframeSuggestion,
     checkpoints,
     signalTime: Date.now(),
   };
 }
 
-module.exports = { generateBinarySignal, normalCdf, formatMinutes };
+module.exports = {
+  generateBinarySignal,
+  computeSignalCore,
+  requiredFetchSize,
+  buildConfluence,
+  decideFinalSignal,
+  normalCdf,
+  formatMinutes,
+  logReturns,
+  mean,
+  stdev,
+  GROUP_WEIGHTS,
+};
