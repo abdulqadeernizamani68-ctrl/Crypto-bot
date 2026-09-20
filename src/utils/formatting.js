@@ -9,37 +9,129 @@ function fmtNum(n, decimals = null) {
   return Number(n).toFixed(d);
 }
 
-function formatBinarySignalMessage(signal) {
+function regimeLine(regime) {
+  const parts = [regime.primary];
+  if (regime.volatility && regime.volatility !== 'UNKNOWN') parts.push(`${regime.volatility} volatility`);
+  let line = parts.join(', ');
+  if (regime.volatilityPercentile != null) {
+    line += ` (${regime.volatilityPercentile}th percentile vs this pair's recent range)`;
+  }
+  return line;
+}
+
+function formatBinarySignalMessage(signal, opts = {}) {
   const durationLabel = binaryEngine.formatMinutes(signal.durationMinutes);
-  const finalCp = signal.checkpoints[signal.checkpoints.length - 1];
+  const expiryPerf = opts.expiryPerf;
+
   const lines = [
     `*${signal.symbol} - Binary/Time-based Signal*`,
     '',
+    `Direction: *${signal.direction}*${signal.direction === 'NO_TRADE' ? ' (no trade taken)' : ''}`,
     `Entry Price: ${fmtNum(signal.entryPrice)}`,
-    `Duration: ${durationLabel}`,
-    `Predicted at expiry: price will be *${signal.direction}* entry, around **${fmtNum(finalCp.predictedPrice)}** (likely range ${fmtNum(finalCp.rangeLow)} - ${fmtNum(finalCp.rangeHigh)})`,
-    `Confidence: ${signal.confidence}%${signal.highTrust ? ' 🔥 HIGH-TRUST SETUP' : ''}`,
+    `Expiry: ${durationLabel} (bucket: ${signal.expiryBucket.label})`,
+    `Market Regime: ${regimeLine(signal.regime)}`,
     '',
-    `Market structure: ${signal.structure.pattern}`,
-    `Volatility: ${signal.volatilityRegime.regime}${signal.volatilityRegime.percentile != null ? ` (${signal.volatilityRegime.percentile}th percentile vs this pair's recent range)` : ''}`,
+    `Model (raw) Probability: ${signal.rawProbability}% - this is what the drift/volatility math computed, NOT a claim about real-world accuracy`,
+    `Calibrated Probability: ${signal.calibratedProbability}%` +
+      ` (from ${signal.calibrationSampleSize} closed trade${signal.calibrationSampleSize === 1 ? '' : 's'} in this exact expiry+probability bucket` +
+      `${signal.calibrationLowConfidence ? ', still building - treat as provisional' : ''})` +
+      (signal.calibrationRecentSampleSize
+        ? ` [recent ${signal.calibrationRecentSampleSize}: ${signal.calibrationRecentWinRatePct}%]`
+        : ''),
   ];
+
+  if (expiryPerf && expiryPerf.total > 0) {
+    lines.push(
+      `Historical Accuracy (${signal.expiryBucket.label} expiries, all setups): ${expiryPerf.winRatePct}% (n=${expiryPerf.total})`
+    );
+  } else {
+    lines.push(`Historical Accuracy (${signal.expiryBucket.label} expiries): no completed trades yet in this bucket`);
+  }
+
+  lines.push(`Confidence/Quality: ${signal.qualityLabel}${signal.highTrust ? ' 🔥 HIGH-TRUST SETUP' : ''}`);
+
+  if (signal.direction === 'NO_TRADE') {
+    lines.push('', 'Why NO TRADE:', ...signal.noTradeReasons.map((r) => `- ${r}`));
+    lines.push(
+      '',
+      `(For reference, the raw math leaned ${signal.rawDirection} - shown for transparency only, not a signal to act on.)`
+    );
+  } else {
+    const finalCp = signal.checkpoints[signal.checkpoints.length - 1];
+    lines.push(
+      '',
+      `Predicted at expiry: price will be *${signal.direction}* entry, around **${fmtNum(finalCp.predictedPrice)}** (likely range ${fmtNum(finalCp.rangeLow)} - ${fmtNum(finalCp.rangeHigh)})`
+    );
+  }
+
+  lines.push('', `Structure: ${signal.structure.pattern}`);
 
   if (signal.supportResistance.support || signal.supportResistance.resistance) {
     const s = signal.supportResistance.support;
     const r = signal.supportResistance.resistance;
     lines.push(
-      `Nearest levels: ${s ? `support ${fmtNum(s.price)} (${s.touches}x touched)` : 'no clear support nearby'} | ` +
-      `${r ? `resistance ${fmtNum(r.price)} (${r.touches}x touched)` : 'no clear resistance nearby'}`
+      `Nearest levels: ${s ? `support ${fmtNum(s.price)} (${s.touches}x touched, strength ${s.strength ?? '-'})` : 'no clear support nearby'} | ` +
+      `${r ? `resistance ${fmtNum(r.price)} (${r.touches}x touched, strength ${r.strength ?? '-'})` : 'no clear resistance nearby'}`
     );
   }
   if (signal.breakout) {
-    lines.push(`Breakout: ${signal.breakout.type.replace(/_/g, ' ').toLowerCase()}${signal.breakout.retested ? ' (retested)' : ' (not yet retested)'}`);
+    const b = signal.breakout;
+    const bits = [b.type.replace(/_/g, ' ').toLowerCase()];
+    bits.push(b.retested ? 'retested' : 'not yet retested');
+    if (b.quality != null) bits.push(`quality ${b.quality}`);
+    if (b.volumeConfirmed === true) bits.push('volume-confirmed');
+    else if (b.volumeConfirmed === false) bits.push('NOT volume-confirmed');
+    if (b.falseBreakout) bits.push('⚠️ FALSE BREAKOUT (failed)');
+    lines.push(`Breakout: ${bits.join(', ')}`);
+  }
+  if (signal.multiTimeframe) {
+    const agreeLabel = signal.multiTimeframe.agreement === false
+      ? 'DISAGREES with native timeframe'
+      : signal.multiTimeframe.agreement === true
+        ? 'agrees with native timeframe'
+        : 'no strong opinion either way';
+    lines.push(`Higher-timeframe (${signal.multiTimeframe.label}) tilt: ${signal.multiTimeframe.tilt} - ${agreeLabel}`);
+  }
+
+  // ---- Volume ----
+  if (signal.volume && signal.volume.available) {
+    const v = signal.volume;
+    lines.push(
+      `Volume: RVOL ${v.rvol ?? '-'}${v.spike ? ' 🔺SPIKE' : ''}, trend ${v.trend}, price/volume: ${v.priceVolumeRelationship}`
+    );
+  } else {
+    lines.push(`Volume: unavailable${signal.volume?.reason ? ` (${signal.volume.reason})` : ' for this instrument'}`);
+  }
+
+  // ---- Candle quality ----
+  if (signal.candleQuality && signal.candleQuality.available) {
+    const cq = signal.candleQuality;
+    lines.push(`Candle: body ${Math.round(cq.bodyRatio * 100)}% of range${cq.tags.length ? `, ${cq.tags.join(', ')}` : ''}`);
+  }
+
+  // ---- Divergences ----
+  if (signal.divergences && signal.divergences.length) {
+    lines.push(
+      `Divergence: ${signal.divergences.map((d) => `${d.type} ${d.kind} ${d.direction}${d.confirmed ? ' (confirmed)' : ' (unconfirmed)'}`).join('; ')}`
+    );
+  }
+
+  // ---- Session ----
+  if (signal.session) {
+    lines.push(`Session: ${signal.session.session} (${signal.session.weekdayLabel}, ${signal.session.hourUTC}:00 UTC)`);
+  }
+
+  if (signal.dataQualityIssues && signal.dataQualityIssues.length) {
+    lines.push(`Data quality notes: ${signal.dataQualityIssues.join('; ')}`);
   }
 
   lines.push(
     '',
-    'Confluence (what actually drove this call, strongest first):',
-    ...signal.confluenceBreakdown.slice(0, 6).map((f) => `- ${f.factor}: ${f.score > 0 ? '+' : ''}${f.score} (${f.score > 0 ? 'bullish' : f.score < 0 ? 'bearish' : 'neutral'})`),
+    'Confluence (grouped so correlated indicators don\'t get double-counted):',
+    ...Object.entries(signal.confluenceGroupScores).map(([g, s]) => `- ${g}: ${s > 0 ? '+' : ''}${s}`),
+    '',
+    'Individual factors (strongest first):',
+    ...signal.confluenceBreakdown.slice(0, 10).map((f) => `- [${f.group}] ${f.factor}: ${f.score > 0 ? '+' : ''}${f.score}`),
     ''
   );
 
@@ -52,13 +144,15 @@ function formatBinarySignalMessage(signal) {
     );
   }
 
-  lines.push(
-    'Chances + expected price at each checkpoint (from measured recent volatility + drift):',
-    ...signal.checkpoints.map((cp) =>
-      `- ${cp.label}: ${cp.direction} with ${cp.probabilityPct}% chance - expected ~${fmtNum(cp.predictedPrice)} (range ${fmtNum(cp.rangeLow)}-${fmtNum(cp.rangeHigh)})`
-    ),
-    ''
-  );
+  if (signal.direction !== 'NO_TRADE') {
+    lines.push(
+      'Checkpoints along the way (raw model math, NOT individually calibrated - only the Expiry checkpoint above has a calibrated probability):',
+      ...signal.checkpoints.map((cp) =>
+        `- ${cp.label}: ${cp.direction} ${cp.probabilityPct}% (raw) - expected ~${fmtNum(cp.predictedPrice)} (range ${fmtNum(cp.rangeLow)}-${fmtNum(cp.rangeHigh)})`
+      ),
+      ''
+    );
+  }
   if (signal.durationMinutes < 1) {
     lines.push(
       '_Sub-minute duration: extrapolated below the native 1-minute candle',
@@ -66,12 +160,10 @@ function formatBinarySignalMessage(signal) {
     );
   }
   lines.push(
-    '_Price targets are a point estimate + ~68% range (1 std dev), not a',
-    'guarantee - actual price can land outside the range. Liquidity/order-book',
-    'data is not available from this data source, so it is not part of this',
-    'analysis. Estimate on the real market feed (Twelve Data), not Quotex\'s',
-    'own OTC price - see README for why those can differ. Analysis only,',
-    'not financial advice._'
+    '_Estimate on the real market feed (Twelve Data), not Quotex\'s own OTC',
+    'price - see README for why those can differ. Calibrated probability and',
+    'historical accuracy are only as good as the sample size shown next to',
+    'them - small samples are noisy. Analysis only, not financial advice._'
   );
   return lines.join('\n');
 }
@@ -79,17 +171,59 @@ function formatBinarySignalMessage(signal) {
 function formatBinaryStatsMessage(stats) {
   const lines = [
     '*Binary Signal Accuracy*',
-    `Total Signals: ${stats.totalSignals}`,
+    `Total Completed Signals: ${stats.totalSignals}`,
     `Wins: ${stats.wins}`,
     `Losses: ${stats.losses}`,
-    `Win Rate: ${stats.winRate}%`,
+    `Overall Win Rate: ${stats.winRate}% (this is the actual historical win rate, not a model probability)`,
   ];
+
+  if (stats.expiryPerf?.length) {
+    lines.push('', 'Win rate by expiry length (actual, not model probability):');
+    stats.expiryPerf.forEach((e) => {
+      lines.push(`- ${e.label}: ${e.winRatePct}% (n=${e.total})`);
+    });
+  } else {
+    lines.push('', 'Win rate by expiry length: no completed trades yet.');
+  }
+
+  if (stats.regimePerf?.length) {
+    lines.push('', 'Win rate by market regime (5+ samples shown with more trust):');
+    stats.regimePerf.forEach((r) => {
+      const flag = r.total < 5 ? ' (small sample)' : '';
+      lines.push(`- ${r.regime}: ${r.winRatePct}% (n=${r.total})${flag}`);
+    });
+  }
+
   if (stats.checkpointAccuracy?.length) {
-    lines.push('', 'Accuracy by checkpoint (all durations combined):');
+    lines.push('', 'Raw-math accuracy by checkpoint fraction (all expiries pooled - diagnostic only):');
     stats.checkpointAccuracy.forEach((c) => {
       lines.push(`- ${c.label}: ${c.accuracyPct}% (n=${c.total})`);
     });
   }
+
+  if (stats.sessionPerf?.length) {
+    lines.push('', 'Win rate by session/time-of-day:');
+    stats.sessionPerf.forEach((s) => {
+      const flag = s.total < 5 ? ' (small sample)' : '';
+      lines.push(`- ${s.key}: ${s.winRatePct}% (n=${s.total})${flag}`);
+    });
+  }
+
+  if (stats.featurePerf?.length) {
+    lines.push('', 'Feature-importance (#16 - real recorded outcomes, present vs. absent, not theory):');
+    stats.featurePerf.forEach((f) => {
+      const flag = f.total < 10 ? ' (small sample)' : '';
+      lines.push(`- ${f.key}: ${f.winRatePct}% (n=${f.total})${flag}`);
+    });
+    lines.push('  (compare "<flag>:true" vs "<flag>:false" rows for the same flag to see if it actually helps)');
+  }
+
+  lines.push(
+    '',
+    '_If a bucket above shows a small n, treat its win rate as noisy, not settled -',
+    'this bot reports whatever the real numbers are, including when they are weak._'
+  );
+
   return lines.join('\n');
 }
 
