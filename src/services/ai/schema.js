@@ -1,191 +1,165 @@
-// ---- AI analysis response schema + validator ----
-// Hand-rolled validators, not a library (ajv etc. isn't in package.json
-// and this environment has no network to add one) - but they're REAL
-// schema checks, not a shrug: every field is type- and range-checked, and
-// an AI response that fails validation is never passed through to the
-// user or the comparison engine. Two shapes are validated: the STAGE-1
-// independent analysis (validateAIAnalysis) and the STAGE-2 final synthesis
-// (validateSynthesis). Section S ("validate all external AI
-// responses before using them", "do not execute arbitrary code/function
-// calls returned by AI") is enforced here, in one place, rather than
-// trusted ad hoc at each call site.
+// ---- AI response schema validation ----
+// Hand-rolled validators (no ajv dependency - not in package.json, see
+// README) for the two JSON shapes the model is asked to return (see
+// prompt.js for the exact prompts that describe these shapes to it):
+//   validateAIAnalysis  - STAGE 1, the independent analysis (buildPrompt)
+//   validateSynthesis   - STAGE 2, the final synthesis (buildSynthesisPrompt)
+//
+// Both validators:
+//   - reject anything that isn't a plain object (null, arrays, primitives)
+//   - build a NEW object containing only the fields they recognize, so the
+//     returned `value` is always a clean whitelist copy - unexpected/extra
+//     keys in the model's response are silently dropped, never passed
+//     through
+//   - reject any object (at any depth) that carries a key shaped like a
+//     function-call / tool-call / executable-code field, since the model's
+//     JSON answer is data to display, never instructions or code to run
+//     (see the README's "rejects anything resembling a function-call/code
+//     field outright" note)
+//   - bound every string/list length so one runaway field can't blow up a
+//     Discord message or smuggle an oversized payload through a
+//     short-looking reply
+//
+// Returns { ok: true, value } on success, { ok: false, errors: [...] } on
+// failure. Neither validator ever throws - a bad response is just another
+// status for analyst.js to report, not a crash.
 
-const VALID_CONCLUSIONS = ['UP', 'DOWN', 'NO_VIEW'];
-const VALID_CONFIDENCE = ['LOW', 'MEDIUM', 'HIGH'];
-const VALID_VIEW_BIAS = ['BULLISH', 'BEARISH', 'NEUTRAL', 'UNCLEAR', 'UNAVAILABLE'];
+const MAX_SHORT_STRING = 300; // headline / note / bullet-item length
+const MAX_LONG_STRING = 1500; // report / reasoningSummary / agreementSummary
+const MAX_LIST_ITEMS = 8; // prompts ask the model for <=6; a little headroom, still bounded
 
-function isNonEmptyString(v) {
-  return typeof v === 'string' && v.trim().length > 0;
+// Keys with no legitimate place in an analysis/report JSON object - the
+// shape a prompt-injection or function/tool-calling attempt would take.
+// Checked recursively (not just at the top level) since the same trick
+// could be nested one level down inside a note/bullet field.
+const BANNED_KEYS = new Set([
+  'function_call', 'functioncall', 'function_calls', 'tool_call', 'tool_calls',
+  'toolcall', 'toolcalls', 'code', 'script', 'exec', 'eval', 'shell', 'command',
+  'system_instruction', 'systeminstruction', '__proto__', 'constructor', 'prototype',
+]);
+
+function hasBannedKey(value, depth = 0) {
+  if (depth > 6 || value === null || typeof value !== 'object') return false;
+  if (Array.isArray(value)) return value.some((v) => hasBannedKey(v, depth + 1));
+  return Object.keys(value).some((k) => BANNED_KEYS.has(k.toLowerCase()) || hasBannedKey(value[k], depth + 1));
 }
-function isStringArray(v, maxLen = 12) {
-  return Array.isArray(v) && v.length <= maxLen && v.every((x) => typeof x === 'string');
+
+function isPlainObject(value) {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
 }
 
-// A "view" is the small shape used for trend/momentum/structure/
-// volatility/volume/regime/mtf below - a bias plus a short plain-text note.
-function validateView(view, path, errors) {
-  if (view == null || typeof view !== 'object') {
-    errors.push(`${path}: missing or not an object`);
-    return;
-  }
-  if (!VALID_VIEW_BIAS.includes(view.bias)) {
-    errors.push(`${path}.bias: must be one of ${VALID_VIEW_BIAS.join('/')}, got ${JSON.stringify(view.bias)}`);
-  }
-  if (view.note != null && typeof view.note !== 'string') {
-    errors.push(`${path}.note: must be a string if present`);
-  }
-  if (view.note && view.note.length > 400) {
-    errors.push(`${path}.note: too long (${view.note.length} chars, max 400) - reject rather than truncate silently`);
-  }
+function isEnum(value, allowed) {
+  return typeof value === 'string' && allowed.includes(value);
 }
 
-// Validates a parsed (already JSON.parse'd) AI analysis object. Returns
-// { ok: true, value } or { ok: false, errors: [...] } - never throws.
-function validateAIAnalysis(obj) {
+function isBoundedString(value, { max = MAX_SHORT_STRING, min = 1 } = {}) {
+  return typeof value === 'string' && value.length >= min && value.length <= max;
+}
+
+function isBoundedStringArray(value, { maxItems = MAX_LIST_ITEMS, maxLen = MAX_SHORT_STRING } = {}) {
+  return Array.isArray(value)
+    && value.length <= maxItems
+    && value.every((item) => isBoundedString(item, { max: maxLen, min: 1 }));
+}
+
+const BIAS_VALUES = ['BULLISH', 'BEARISH', 'NEUTRAL', 'UNCLEAR', 'UNAVAILABLE'];
+
+function isBiasNote(value) {
+  return isPlainObject(value) && isEnum(value.bias, BIAS_VALUES) && isBoundedString(value.note);
+}
+
+function fail(errors) {
+  return { ok: false, errors };
+}
+
+// ---- STAGE 1: independent analysis (see prompt.js buildPrompt) ----
+const STAGE1_GROUPS = ['trend', 'momentum', 'structure', 'volatility', 'volume', 'regime', 'mtf'];
+const STAGE1_LISTS = ['keyEvidence', 'contradictions', 'limitations'];
+
+function validateAIAnalysis(raw) {
+  if (!isPlainObject(raw)) return fail(['response is not a JSON object']);
+  if (hasBannedKey(raw)) return fail(['response contains a function-call/code-like field']);
+
   const errors = [];
-  if (obj == null || typeof obj !== 'object' || Array.isArray(obj)) {
-    return { ok: false, errors: ['response is not a JSON object'] };
-  }
+  if (!isEnum(raw.conclusion, ['UP', 'DOWN', 'NO_VIEW'])) errors.push('conclusion must be UP, DOWN or NO_VIEW');
+  if (!isEnum(raw.confidence, ['LOW', 'MEDIUM', 'HIGH'])) errors.push('confidence must be LOW, MEDIUM or HIGH');
+  STAGE1_GROUPS.forEach((g) => { if (!isBiasNote(raw[g])) errors.push(`${g} must be a { bias, note } object`); });
+  STAGE1_LISTS.forEach((f) => {
+    if (!isBoundedStringArray(raw[f])) errors.push(`${f} must be a list of at most ${MAX_LIST_ITEMS} short strings`);
+  });
+  if (!isBoundedString(raw.reasoningSummary, { max: MAX_LONG_STRING })) errors.push('reasoningSummary must be a non-empty string');
 
-  if (!VALID_CONCLUSIONS.includes(obj.conclusion)) {
-    errors.push(`conclusion: must be one of ${VALID_CONCLUSIONS.join('/')}, got ${JSON.stringify(obj.conclusion)}`);
-  }
-  if (!VALID_CONFIDENCE.includes(obj.confidence)) {
-    errors.push(`confidence: must be one of ${VALID_CONFIDENCE.join('/')}, got ${JSON.stringify(obj.confidence)}`);
-  }
+  if (errors.length) return fail(errors);
 
-  ['trend', 'momentum', 'structure', 'volatility', 'volume', 'regime', 'mtf'].forEach((key) => {
-    validateView(obj[key], key, errors);
+  const value = {
+    conclusion: raw.conclusion,
+    confidence: raw.confidence,
+    reasoningSummary: raw.reasoningSummary,
+  };
+  STAGE1_GROUPS.forEach((g) => { value[g] = { bias: raw[g].bias, note: raw[g].note }; });
+  STAGE1_LISTS.forEach((f) => { value[f] = raw[f]; });
+  return { ok: true, value };
+}
+
+// ---- STAGE 2: final synthesis (see prompt.js buildSynthesisPrompt) ----
+const STAGE2_LISTS = ['whereTheyAgree', 'whereTheyDisagree', 'contradictions', 'dataQualityLimitations', 'whatWouldChangeTheView'];
+
+function validateSynthesis(raw) {
+  if (!isPlainObject(raw)) return fail(['response is not a JSON object']);
+  if (hasBannedKey(raw)) return fail(['response contains a function-call/code-like field']);
+
+  const errors = [];
+  if (!isEnum(raw.overallView, ['UP', 'DOWN', 'NO_VIEW'])) errors.push('overallView must be UP, DOWN or NO_VIEW');
+  if (!isEnum(raw.confidence, ['LOW', 'MEDIUM', 'HIGH'])) errors.push('confidence must be LOW, MEDIUM or HIGH');
+  if (!isBoundedString(raw.headline)) errors.push(`headline must be 1-${MAX_SHORT_STRING} characters`);
+  if (!isBoundedString(raw.agreementSummary, { max: MAX_LONG_STRING })) errors.push('agreementSummary must be a non-empty string');
+  if (!isBoundedString(raw.report, { max: MAX_LONG_STRING })) errors.push(`report must be 1-${MAX_LONG_STRING} characters`);
+  STAGE2_LISTS.forEach((f) => {
+    if (!isBoundedStringArray(raw[f])) errors.push(`${f} must be a list of at most ${MAX_LIST_ITEMS} short strings`);
   });
 
-  if (!isStringArray(obj.keyEvidence, 10)) errors.push('keyEvidence: must be an array of <=10 strings');
-  if (!isStringArray(obj.contradictions, 10)) errors.push('contradictions: must be an array of <=10 strings');
-  if (!isStringArray(obj.limitations, 10)) errors.push('limitations: must be an array of <=10 strings');
+  if (errors.length) return fail(errors);
 
-  if (!isNonEmptyString(obj.reasoningSummary)) {
-    errors.push('reasoningSummary: must be a non-empty string');
-  } else if (obj.reasoningSummary.length > 1500) {
-    errors.push(`reasoningSummary: too long (${obj.reasoningSummary.length} chars, max 1500)`);
-  }
-
-  // Explicitly reject anything that looks like an attempt to get executed
-  // rather than displayed - AI output is data, never code (section S).
-  const dangerousKeys = ['function_call', 'functionCall', 'tool_use', 'toolUse', 'code', 'script', 'exec'];
-  for (const k of dangerousKeys) {
-    if (Object.prototype.hasOwnProperty.call(obj, k)) {
-      errors.push(`response contains a disallowed field "${k}" - AI output is never treated as executable`);
-    }
-  }
-
-  if (errors.length) return { ok: false, errors };
-
-  // Build a clean, whitelisted output object - anything the model added
-  // beyond the schema is simply dropped, not carried forward.
-  const clean = {
-    conclusion: obj.conclusion,
-    confidence: obj.confidence,
-    trend: { bias: obj.trend.bias, note: obj.trend.note || '' },
-    momentum: { bias: obj.momentum.bias, note: obj.momentum.note || '' },
-    structure: { bias: obj.structure.bias, note: obj.structure.note || '' },
-    volatility: { bias: obj.volatility.bias, note: obj.volatility.note || '' },
-    volume: { bias: obj.volume.bias, note: obj.volume.note || '' },
-    regime: { bias: obj.regime.bias, note: obj.regime.note || '' },
-    mtf: { bias: obj.mtf.bias, note: obj.mtf.note || '' },
-    keyEvidence: obj.keyEvidence,
-    contradictions: obj.contradictions,
-    limitations: obj.limitations,
-    reasoningSummary: obj.reasoningSummary,
+  const value = {
+    overallView: raw.overallView,
+    confidence: raw.confidence,
+    headline: raw.headline,
+    agreementSummary: raw.agreementSummary,
+    report: raw.report,
   };
-
-  return { ok: true, value: clean };
+  STAGE2_LISTS.forEach((f) => { value[f] = raw[f]; });
+  return { ok: true, value };
 }
 
-// ---- STAGE 2: final synthesis ----
-const SYNTHESIS_LIST_FIELDS = ['whereTheyAgree', 'whereTheyDisagree', 'contradictions', 'dataQualityLimitations', 'whatWouldChangeTheView'];
-const SYNTHESIS_MAX_ITEMS = 8;
-const SYNTHESIS_MAX_ITEM_CHARS = 300;
-
-function isBoundedStringList(v) {
-  return Array.isArray(v)
-    && v.length <= SYNTHESIS_MAX_ITEMS
-    && v.every((x) => typeof x === 'string' && x.length <= SYNTHESIS_MAX_ITEM_CHARS);
-}
-
-// Validates the parsed final-synthesis object. Same contract as
-// validateAIAnalysis: { ok: true, value } | { ok: false, errors }, never
-// throws, and `value` is a clean whitelisted copy - anything extra the model
-// added is dropped, not carried forward.
-function validateSynthesis(obj) {
-  const errors = [];
-  if (obj == null || typeof obj !== 'object' || Array.isArray(obj)) {
-    return { ok: false, errors: ['response is not a JSON object'] };
-  }
-
-  if (!VALID_CONCLUSIONS.includes(obj.overallView)) {
-    errors.push(`overallView: must be one of ${VALID_CONCLUSIONS.join('/')}, got ${JSON.stringify(obj.overallView)}`);
-  }
-  if (!VALID_CONFIDENCE.includes(obj.confidence)) {
-    errors.push(`confidence: must be one of ${VALID_CONFIDENCE.join('/')}, got ${JSON.stringify(obj.confidence)}`);
-  }
-  if (!isNonEmptyString(obj.headline) || obj.headline.length > 300) {
-    errors.push('headline: must be a non-empty string of at most 300 characters');
-  }
-  if (!isNonEmptyString(obj.agreementSummary) || obj.agreementSummary.length > 700) {
-    errors.push('agreementSummary: must be a non-empty string of at most 700 characters');
-  }
-  SYNTHESIS_LIST_FIELDS.forEach((key) => {
-    if (!isBoundedStringList(obj[key])) {
-      errors.push(`${key}: must be an array of <=${SYNTHESIS_MAX_ITEMS} strings, each <=${SYNTHESIS_MAX_ITEM_CHARS} chars`);
-    }
-  });
-  if (!isNonEmptyString(obj.report) || obj.report.length > 1500) {
-    errors.push('report: must be a non-empty string of at most 1500 characters');
-  }
-
-  const dangerousKeys = ['function_call', 'functionCall', 'tool_use', 'toolUse', 'code', 'script', 'exec'];
-  for (const k of dangerousKeys) {
-    if (Object.prototype.hasOwnProperty.call(obj, k)) {
-      errors.push(`response contains a disallowed field "${k}" - AI output is never treated as executable`);
-    }
-  }
-
-  if (errors.length) return { ok: false, errors };
-
-  return {
-    ok: true,
-    value: {
-      overallView: obj.overallView,
-      confidence: obj.confidence,
-      headline: obj.headline.trim(),
-      agreementSummary: obj.agreementSummary.trim(),
-      whereTheyAgree: obj.whereTheyAgree,
-      whereTheyDisagree: obj.whereTheyDisagree,
-      contradictions: obj.contradictions,
-      dataQualityLimitations: obj.dataQualityLimitations,
-      whatWouldChangeTheView: obj.whatWouldChangeTheView,
-      report: obj.report.trim(),
-    },
-  };
-}
-
-module.exports = { validateAIAnalysis, validateSynthesis, VALID_CONCLUSIONS, VALID_CONFIDENCE, VALID_VIEW_BIAS };
-
-// Pulls a JSON object out of a raw model response - handles the common
-// case of the model wrapping it in a ```json ... ``` fence despite being
-// asked not to, and otherwise takes the response as-is. Returns
-// { parsed, error } - never throws.
+// ---- Extracting a JSON object out of raw model text ----
+// The prompts ask for "ONLY a JSON object, no markdown fences", but models
+// sometimes wrap the answer in ```json ... ``` anyway, or add stray text
+// around it. This recovers the JSON object in that case instead of failing
+// on cosmetic wrapping - it does not relax anything validateAIAnalysis/
+// validateSynthesis check afterwards. Never throws.
 function extractJson(text) {
-  if (typeof text !== 'string' || !text.trim()) {
-    return { parsed: null, error: 'empty response text' };
+  if (typeof text !== 'string' || !text.trim()) return { parsed: null, error: 'empty response text' };
+
+  const attempts = [text.trim()];
+
+  const fenced = text.match(/```(?:json)?\s*([\s\S]*?)\s*```/i);
+  if (fenced) attempts.push(fenced[1].trim());
+
+  const first = text.indexOf('{');
+  const last = text.lastIndexOf('}');
+  if (first !== -1 && last > first) attempts.push(text.slice(first, last + 1));
+
+  let lastErr = 'no JSON object found in response';
+  for (let i = 0; i < attempts.length; i += 1) {
+    try {
+      const parsed = JSON.parse(attempts[i]);
+      if (isPlainObject(parsed)) return { parsed, error: null };
+      lastErr = 'response was valid JSON but not an object';
+    } catch (err) {
+      lastErr = err.message;
+    }
   }
-  let candidate = text.trim();
-  const fenceMatch = candidate.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fenceMatch) candidate = fenceMatch[1].trim();
-  try {
-    return { parsed: JSON.parse(candidate), error: null };
-  } catch (err) {
-    return { parsed: null, error: `JSON parse failed: ${err.message}` };
-  }
+  return { parsed: null, error: lastErr };
 }
 
-module.exports.extractJson = extractJson;
+module.exports = { extractJson, validateAIAnalysis, validateSynthesis };
