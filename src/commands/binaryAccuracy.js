@@ -1,4 +1,5 @@
 const binaryStore = require('../services/binaryStore');
+const calibrationSvc = require('../services/calibration');
 const config = require('../config');
 const { formatBinaryStatsMessage, formatBinarySignalJourney } = require('../utils/formatting');
 const logger = require('../utils/logger');
@@ -23,7 +24,17 @@ async function handleBinaryAccuracyCommand() {
       })
     );
 
-    const parts = [formatBinaryStatsMessage({ totalSignals, wins, losses, winRate, checkpointAccuracy })];
+    // Requirement: performance reported separately by expiry length AND by
+    // market regime - this is the ACTUAL win rate (wins/completed x 100),
+    // never the model's own probability number.
+    const expiryPerf = (await calibrationSvc.getAllExpiryPerf()).filter((r) => r.total > 0);
+    const regimePerf = await calibrationSvc.getAllRegimePerf();
+    const sessionPerf = await calibrationSvc.getAllSessionPerf();
+    const featurePerf = await calibrationSvc.getAllFeaturePerf();
+
+    const parts = [
+      formatBinaryStatsMessage({ totalSignals, wins, losses, winRate, checkpointAccuracy, expiryPerf, regimePerf, sessionPerf, featurePerf }),
+    ];
 
     const recent = await binaryStore.getRecent(5);
     const recentClosed = recent.filter((s) => s.status === 'CLOSED');
