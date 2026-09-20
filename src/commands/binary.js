@@ -1,5 +1,6 @@
 const binaryEngine = require('../services/binaryEngine');
 const binaryStore = require('../services/binaryStore');
+const calibrationSvc = require('../services/calibration');
 const { formatBinarySignalMessage } = require('../utils/formatting');
 const logger = require('../utils/logger');
 
@@ -34,14 +35,26 @@ async function handleBinaryCommand(argText) {
     return 'Usage: !binary EURUSD 5\n' +
       '(symbol, then expiry duration - plain number = minutes)\n' +
       'Duration also accepts s/m/h suffixes, e.g. !binary BTCUSD 30s, !binary BTCUSD 2h, !binary BTCUSD 48h\n' +
-      'Range: 5 seconds to 48 hours.';
+      'Range: 5 seconds to 48 hours.\n' +
+      'Reply can be UP, DOWN, or NO TRADE - a weak/unreliable setup is reported honestly, not forced.';
   }
 
   try {
     const signal = await binaryEngine.generateBinarySignal(parsed.symbol, parsed.duration);
-    const id = binaryStore.newId(signal.symbol);
-    await binaryStore.saveNew({ ...signal, id, status: 'OPEN', result: null });
-    return formatBinarySignalMessage(signal);
+
+    // A NO_TRADE signal is not persisted as an open trade - there is
+    // nothing to track a win/loss for, since no trade was actually called.
+    // It's still shown in full so the reasoning is visible.
+    if (signal.direction !== 'NO_TRADE') {
+      const id = binaryStore.newId(signal.symbol);
+      await binaryStore.saveNew({ ...signal, id, status: 'OPEN', result: null });
+    }
+
+    // Real historical accuracy for THIS expiry bucket, shown alongside the
+    // model's own probability - separate numbers, never blended.
+    const expiryPerf = await calibrationSvc.getExpiryPerf(signal.expiryBucket.key);
+
+    return formatBinarySignalMessage(signal, { expiryPerf });
   } catch (err) {
     logger.error('binary command failed:', err.message);
     return `Could not generate a binary signal for ${parsed.symbol}: ${err.message}`;
