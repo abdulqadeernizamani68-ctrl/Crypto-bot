@@ -12,6 +12,14 @@ const config = require('../../config');
 const logger = require('../../utils/logger');
 const { buildPrompt, buildSynthesisPrompt } = require('./prompt');
 
+// NOTE: deliberately no list of "known good/bad" model ids here (see
+// config.js's comment on GEMINI_MODEL). Gemini model ids are retired on a
+// rolling basis, so any such list embedded in code would itself go stale
+// and start giving false confidence. The API's own 404 (handled below) is
+// the source of truth for "this model id no longer exists" - this module's
+// job is just to make that failure clear and point at where to look, not to
+// pre-judge model ids itself.
+
 function buildRequestBody(context, language, kind = 'independent') {
   const prompt = kind === 'synthesis'
     ? buildSynthesisPrompt(context, language)
@@ -54,7 +62,7 @@ async function callOnce(requestBody, timeoutMs, externalSignal) {
   if (!model) {
     throw new Error('GEMINI_MODEL is not set - cannot call the Gemini provider (set it to a currently supported model id)');
   }
-  const url = `${baseUrl}/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
+  const url = `${baseUrl}/models/${encodeURIComponent(model)}:generateContent`;
 
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -70,13 +78,19 @@ async function callOnce(requestBody, timeoutMs, externalSignal) {
   try {
     const res = await fetch(url, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      // Auth via the x-goog-api-key header, per Google's current guidance
+      // (the older `?key=` query-string form still works, but puts the key
+      // in URLs/access logs/error messages - the header keeps it out of
+      // all of those). See https://ai.google.dev/gemini-api/docs/api-key
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
       body: JSON.stringify(requestBody),
       signal: controller.signal,
     });
     if (!res.ok) {
       const errBody = await res.text().catch(() => '');
-      const hint = res.status === 404 ? ' (model not found - check GEMINI_MODEL is a currently supported model id)' : '';
+      const hint = res.status === 404
+        ? ' (model not found or retired - check GEMINI_MODEL against https://ai.google.dev/gemini-api/docs/models)'
+        : '';
       const err = new Error(`Gemini API error ${res.status}${hint}: ${errBody.slice(0, 300)}`);
       err.status = res.status;
       // Surface rate-limit/quota distinctly so callers can react (e.g. back
