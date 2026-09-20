@@ -8,11 +8,12 @@
 //
 // relationship values: 'AGREEMENT' | 'PARTIAL_AGREEMENT' | 'DISAGREEMENT'
 //   | 'INSUFFICIENT_DATA'
-// 'INSUFFICIENT_DATA' covers: the AI call didn't succeed at all (not
-// configured/timeout/error/rate-limited) - there is only one analysis to
-// show, not two to compare, and that is reported plainly rather than
-// hidden (section K: "do not hide disagreement" applies equally to "do
-// not hide the fact that there's nothing to compare against").
+// 'INSUFFICIENT_DATA' covers: either side didn't produce an analysis (AI not
+// configured/timeout/error/rate-limited, or the deterministic bot failed) -
+// there is only one analysis to show, not two to compare, and that is
+// reported plainly rather than hidden (section K: "do not hide
+// disagreement" applies equally to "do not hide the fact that there's
+// nothing to compare against").
 
 const BIAS_SCORE_THRESHOLD = 0.15;
 
@@ -40,6 +41,7 @@ const COMPARABLE_CATEGORIES = [
 function normalizeBotView(signal) {
   const direction = signal.direction === 'NO_TRADE' ? 'NO_VIEW' : signal.direction;
   return {
+    available: true,
     direction,
     confidenceLabel: signal.direction === 'NO_TRADE' ? null : signal.qualityLabel,
     calibratedProbability: signal.direction === 'NO_TRADE' ? null : signal.calibratedProbability,
@@ -97,7 +99,25 @@ function compareCategoryViews(signal, aiAnalysis) {
   return { common, conflicting, dataQualityDifferences };
 }
 
-function compareAnalyses(signal, aiResult) {
+// `signal` is null when the deterministic bot analysis failed (the unified
+// workflow keeps going with whatever evidence exists); `botFailureReason`
+// says why, so the comparison can report the gap instead of hiding it.
+function compareAnalyses(signal, aiResult, botFailureReason = null) {
+  if (!signal) {
+    const aiOnly = normalizeAIView(aiResult);
+    return {
+      relationship: 'INSUFFICIENT_DATA',
+      summary: aiOnly.available
+        ? `Bot analysis unavailable (${botFailureReason || 'did not run'}) - only the independent AI analysis is available for this request.`
+        : `Neither analysis is available (bot: ${botFailureReason || 'did not run'}; AI: ${aiOnly.status}: ${aiOnly.reason}).`,
+      bot: { available: false, direction: null, confidenceLabel: null, calibratedProbability: null, noTradeReasons: [], reason: botFailureReason || 'did not run' },
+      ai: aiOnly,
+      commonEvidence: [],
+      conflictingEvidence: [],
+      dataQualityDifferences: [],
+    };
+  }
+
   const bot = normalizeBotView(signal);
   const ai = normalizeAIView(aiResult);
 
