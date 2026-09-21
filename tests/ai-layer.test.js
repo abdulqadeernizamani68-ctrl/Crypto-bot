@@ -82,7 +82,11 @@ test('config: existing environment variables keep their names and meaning; new o
   assert.strictEqual(cfg.market.workflowTimeoutMs, 120000);
   assert.strictEqual(cfg.ai.gemini.timeoutMs, 60000);
   assert.strictEqual(cfg.ai.gemini.maxOutputTokens, 4096);
+  assert.strictEqual(cfg.ai.gemini.maxRetries, 1);
+  assert.strictEqual(cfg.ai.gemini.retryBaseDelayMs, 1000);
+  assert.strictEqual(cfg.ai.gemini.retryMaxDelayMs, 8000);
   assert.strictEqual(loadConfigInFreshProcess({ MARKET_WORKFLOW_TIMEOUT_MS: '90000' }).market.workflowTimeoutMs, 90000);
+  assert.strictEqual(loadConfigInFreshProcess({ GEMINI_RETRY_BASE_DELAY_MS: '500', GEMINI_RETRY_MAX_DELAY_MS: '4000' }).ai.gemini.retryBaseDelayMs, 500);
 });
 
 test('provider.getConfigProblem names exactly what is missing', () => {
@@ -384,7 +388,9 @@ test('geminiProvider: a caller abort cancels the in-flight request, is a timeout
 test('geminiProvider: its own per-call timeout is a timeout (not "cancelled") and is retried within budget', async () => {
   const f = stubFetch(hangUntilAborted);
   try {
-    await withGemini({ apiKey: 'k', model: 'm', maxRetries: 1, timeoutMs: 30 }, async () => {
+    await withGemini({
+      apiKey: 'k', model: 'm', maxRetries: 1, timeoutMs: 30, retryBaseDelayMs: 1, retryMaxDelayMs: 1,
+    }, async () => {
       await assert.rejects(
         () => geminiProvider.analyze({ context: {}, kind: 'independent' }),
         (err) => err.isTimeout === true && !err.cancelled && /timed out after 30ms/.test(err.message),
@@ -398,7 +404,9 @@ test('geminiProvider: retries a 5xx once; never retries a 429; a 404 points at G
   let n = 0;
   let f = stubFetch(async () => { n += 1; return n === 1 ? failBody(503) : okBody('{"ok":true}'); });
   try {
-    await withGemini({ apiKey: 'k', model: 'm', maxRetries: 1 }, async () => {
+    await withGemini({
+      apiKey: 'k', model: 'm', maxRetries: 1, retryBaseDelayMs: 1, retryMaxDelayMs: 1,
+    }, async () => {
       const r = await geminiProvider.analyze({ context: {}, kind: 'independent' });
       assert.strictEqual(r.text, '{"ok":true}');
     });
@@ -417,6 +425,95 @@ test('geminiProvider: retries a 5xx once; never retries a 429; a 404 points at G
   try {
     await withGemini({ apiKey: 'k', model: 'old-model', maxRetries: 0 }, async () => {
       await assert.rejects(() => geminiProvider.analyze({ context: {}, kind: 'independent' }), /check GEMINI_MODEL/);
+    });
+  } finally { f.restore(); }
+});
+
+// ---- 503 resilience: bounded exponential backoff (not a hammer-and-hope retry) ----
+test('computeBackoffDelayMs: grows with attempt, always bounded by maxDelayMs, honors Retry-After up to the cap', () => {
+  const { computeBackoffDelayMs } = geminiProvider;
+  // Many samples per attempt since there's jitter - every sample must still
+  // respect the exponential ceiling for that attempt.
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const ceiling = Math.min(8000, 1000 * (2 ** attempt));
+    for (let i = 0; i < 20; i += 1) {
+      const d = computeBackoffDelayMs(attempt, { baseDelayMs: 1000, maxDelayMs: 8000, retryAfterMs: null });
+      assert.ok(d >= 0 && d <= ceiling, `attempt ${attempt}: ${d} not in [0, ${ceiling}]`);
+    }
+  }
+  // A huge Retry-After must never push the delay past maxDelayMs - "bounded"
+  // has to hold even when the server suggests otherwise.
+  const withHugeRetryAfter = computeBackoffDelayMs(0, { baseDelayMs: 1000, maxDelayMs: 8000, retryAfterMs: 3600000 });
+  assert.strictEqual(withHugeRetryAfter, 8000);
+  // A small, real Retry-After should be honored (not ignored in favor of a
+  // smaller jittered value).
+  const withSmallRetryAfter = computeBackoffDelayMs(0, { baseDelayMs: 1, maxDelayMs: 8000, retryAfterMs: 500 });
+  assert.strictEqual(withSmallRetryAfter, 500);
+});
+
+test('parseRetryAfterMs: numeric seconds, HTTP-date, and invalid/absent values', () => {
+  const { parseRetryAfterMs } = geminiProvider;
+  assert.strictEqual(parseRetryAfterMs(null), null);
+  assert.strictEqual(parseRetryAfterMs(''), null);
+  assert.strictEqual(parseRetryAfterMs('not-a-value'), null);
+  assert.strictEqual(parseRetryAfterMs('5'), 5000);
+  const future = new Date(Date.now() + 10000).toUTCString();
+  const ms = parseRetryAfterMs(future);
+  assert.ok(ms > 8000 && ms <= 10000, `expected ~10000ms, got ${ms}`);
+});
+
+test('geminiProvider: consecutive 503s actually wait (bounded backoff), not an instant hammer', async () => {
+  const timestamps = [];
+  const f = stubFetch(async () => { timestamps.push(Date.now()); return failBody(503); });
+  const savedRandom = Math.random;
+  Math.random = () => 0.999; // pin jitter near the ceiling so the wait is deterministic to test
+  try {
+    await withGemini({
+      apiKey: 'k', model: 'm', maxRetries: 2, retryBaseDelayMs: 20, retryMaxDelayMs: 20,
+    }, async () => {
+      await assert.rejects(() => geminiProvider.analyze({ context: {}, kind: 'independent' }), /Gemini API error 503/);
+    });
+    assert.strictEqual(timestamps.length, 3, 'initial attempt + 2 retries, then give up');
+    // With jitter pinned near 1 and base === max === 20ms, every gap should
+    // land close to 20ms - allow scheduler slack either way.
+    for (let i = 1; i < timestamps.length; i += 1) {
+      const gap = timestamps[i] - timestamps[i - 1];
+      assert.ok(gap >= 12, `expected a real wait between attempt ${i} and ${i + 1}, got ${gap}ms`);
+    }
+  } finally { Math.random = savedRandom; f.restore(); }
+});
+
+test('geminiProvider: an aborted signal short-circuits a backoff wait instead of sleeping it out', async () => {
+  let n = 0;
+  const f = stubFetch(async () => { n += 1; return failBody(503); });
+  try {
+    await withGemini({
+      apiKey: 'k', model: 'm', maxRetries: 3, retryBaseDelayMs: 5000, retryMaxDelayMs: 5000,
+    }, async () => {
+      const ac = new AbortController();
+      setTimeout(() => ac.abort(), 15); // abort partway through what would be a 5s wait
+      const startedAt = Date.now();
+      await assert.rejects(() => geminiProvider.analyze({ context: {}, kind: 'independent', signal: ac.signal }));
+      assert.ok(Date.now() - startedAt < 1000, 'should not sleep out the full 5s backoff after the deadline aborted');
+    });
+    assert.strictEqual(n, 1, 'no further HTTP attempt once the signal aborted mid-backoff');
+  } finally { f.restore(); }
+});
+
+test('a persistent 503 (retries exhausted) is reported cleanly and never blames the API key', async () => {
+  const f = stubFetch(async () => failBody(503, 'The model is overloaded. Please try again later.'));
+  try {
+    await withGemini({
+      apiKey: 'k', model: 'm', maxRetries: 1, retryBaseDelayMs: 1, retryMaxDelayMs: 1,
+    }, async () => {
+      const r = await analyst.runIndependentAnalysis(makeInputs());
+      assert.strictEqual(r.status, 'ERROR');
+      assert.match(r.reason, /temporarily overloaded/);
+      // It's fine (good, even) for the message to reassure that the key is
+      // NOT the problem - what it must never do is point at the key as
+      // something to fix (rotate/regenerate/check it).
+      assert.doesNotMatch(r.reason, /rotate|regenerate|invalid api key|check your (api )?key/i);
+      assert.strictEqual(r.analysis, null); // no AI opinion...
     });
   } finally { f.restore(); }
 });
