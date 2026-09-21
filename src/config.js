@@ -90,6 +90,14 @@ module.exports = {
       // the old 15s single-call default.
       timeoutMs: num(process.env.GEMINI_TIMEOUT_MS, 60000),
       maxRetries: num(process.env.GEMINI_MAX_RETRIES, 1),
+      // Bounded exponential backoff between retries (see geminiProvider.js's
+      // computeBackoffDelayMs) - e.g. attempt 0 waits up to ~1s, attempt 1 up
+      // to ~2s, etc, jittered, capped at retryMaxDelayMs regardless of how
+      // many retries or what a Retry-After header says. Per Google's own
+      // guidance (https://ai.google.dev/gemini-api/docs/troubleshooting) for
+      // handling 429/5xx errors including 503 UNAVAILABLE.
+      retryBaseDelayMs: num(process.env.GEMINI_RETRY_BASE_DELAY_MS, 1000),
+      retryMaxDelayMs: num(process.env.GEMINI_RETRY_MAX_DELAY_MS, 8000),
       // Newer Gemini models count internal "thinking" tokens against this
       // cap, so a small value can leave no room for the JSON answer itself.
       maxOutputTokens: num(process.env.GEMINI_MAX_OUTPUT_TOKENS, 4096),
