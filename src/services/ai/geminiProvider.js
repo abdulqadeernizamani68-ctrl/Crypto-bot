@@ -34,6 +34,64 @@ function buildRequestBody(context, language, kind = 'independent') {
   };
 }
 
+// ---- Retry timing ----
+// Per https://ai.google.dev/gemini-api/docs/troubleshooting (checked
+// 2026-09-21): "If you receive an error indicating that you should retry
+// your request (such as a 429 RESOURCE_EXHAUSTED or 503 UNAVAILABLE), we
+// recommend implementing an exponential backoff strategy" - wait ~1s before
+// the first retry, double each time, add jitter. Google's own troubleshooting
+// page also separately documents 503 (`service_unavailable`) as "The service
+// is temporarily overloaded or down" - a capacity problem on Google's side,
+// unrelated to which API key is used, so retrying (not rotating keys) is the
+// correct response.
+//
+// This deliberately does NOT extend that same backoff-retry treatment to
+// 429: Google's API-errors reference splits 429 into `rate_limit_exceeded`
+// (retry with backoff) and `quota_exceeded` (wait for the quota to reset -
+// retrying does not help), and the classic generateContent endpoint doesn't
+// reliably tell these apart from the HTTP status alone. Retrying every 429
+// has a documented failure mode in Google's own developer forum: failed
+// retries are themselves counted against the per-minute/per-day quota, so a
+// burst of 503s retried aggressively can compound into a 429 quota problem.
+// Leaving 429 as immediately-fatal (see the `isRateLimit` branch in
+// analyze() below) avoids that trap; RATE_LIMITED is still its own status so
+// analyst.js reports it distinctly rather than masking it as a generic error.
+function computeBackoffDelayMs(attempt, { baseDelayMs, maxDelayMs, retryAfterMs }) {
+  const exponentialCap = Math.min(maxDelayMs, baseDelayMs * (2 ** attempt));
+  let delay = Math.random() * exponentialCap; // "full jitter" - spreads out concurrent retries
+  if (Number.isFinite(retryAfterMs) && retryAfterMs > delay) delay = retryAfterMs;
+  // Bounded no matter what: a server-supplied Retry-After should never turn
+  // a "bounded exponential backoff" policy into an effectively unbounded one.
+  return Math.min(delay, maxDelayMs);
+}
+
+// Retry-After is either a number of seconds or an HTTP-date (RFC 9110). It's
+// not confirmed the classic generateContent endpoint ever sends this header,
+// but honoring it when present costs nothing and is standard HTTP practice.
+function parseRetryAfterMs(headerValue) {
+  if (!headerValue) return null;
+  const asSeconds = Number(headerValue);
+  if (Number.isFinite(asSeconds) && asSeconds >= 0) return asSeconds * 1000;
+  const asDate = Date.parse(headerValue);
+  return Number.isFinite(asDate) ? Math.max(0, asDate - Date.now()) : null;
+}
+
+// Resolves after `ms`, or immediately if `signal` aborts first - so a
+// workflow-deadline cancellation during a backoff wait doesn't sit out the
+// full delay pointlessly. Never rejects; the retry loop's own signal/
+// cancelled checks decide what happens next.
+function sleep(ms, signal) {
+  if (!(ms > 0)) return Promise.resolve();
+  return new Promise((resolve) => {
+    const timer = setTimeout(resolve, ms);
+    if (signal) {
+      const onAbort = () => { clearTimeout(timer); resolve(); };
+      if (signal.aborted) onAbort();
+      else signal.addEventListener('abort', onAbort, { once: true });
+    }
+  });
+}
+
 // Extracts the plain text + usage metadata from a Gemini generateContent
 // response body. Returns null text if the shape isn't what's expected
 // (e.g. the prompt was blocked by safety filters) rather than throwing -
@@ -88,14 +146,19 @@ async function callOnce(requestBody, timeoutMs, externalSignal) {
     });
     if (!res.ok) {
       const errBody = await res.text().catch(() => '');
-      const hint = res.status === 404
-        ? ' (model not found or retired - check GEMINI_MODEL against https://ai.google.dev/gemini-api/docs/models)'
-        : '';
-      const err = new Error(`Gemini API error ${res.status}${hint}: ${errBody.slice(0, 300)}`);
+      const hints = {
+        404: ' (model not found or retired - check GEMINI_MODEL against https://ai.google.dev/gemini-api/docs/models)',
+        // Per Google's docs, 503 is Google-side capacity, never a key/config
+        // problem - worth saying explicitly so nobody "fixes" it by rotating
+        // GEMINI_API_KEY, which cannot change a Google-side capacity issue.
+        503: ' (Gemini\'s service is temporarily overloaded/down - transient, not an API key or config problem; retrying with backoff)',
+      };
+      const err = new Error(`Gemini API error ${res.status}${hints[res.status] || ''}: ${errBody.slice(0, 300)}`);
       err.status = res.status;
       // Surface rate-limit/quota distinctly so callers can react (e.g. back
       // off, or tell the user to try later) without string-matching later.
       err.isRateLimit = res.status === 429;
+      err.retryAfterMs = parseRetryAfterMs(res.headers && typeof res.headers.get === 'function' ? res.headers.get('retry-after') : null);
       throw err;
     }
     const body = await res.json();
@@ -117,14 +180,19 @@ async function callOnce(requestBody, timeoutMs, externalSignal) {
 }
 
 async function analyze({ context, language = 'en', kind = 'independent', signal }) {
-  const { timeoutMs, maxRetries } = config.ai.gemini;
+  const {
+    timeoutMs, maxRetries, retryBaseDelayMs, retryMaxDelayMs,
+  } = config.ai.gemini;
   const requestBody = buildRequestBody(context, language, kind);
 
   let lastErr;
   // Only retry on transport-ish failures (timeout, 5xx, network) - never
   // retry a rate-limit/quota error into a worse rate-limit problem, and
   // never retry a 4xx that isn't going to change (bad request/auth), and
-  // never retry once the caller's own deadline has already passed.
+  // never retry once the caller's own deadline has already passed. Between
+  // retries, wait a bounded, jittered, exponentially increasing delay (see
+  // computeBackoffDelayMs above) rather than hammering an already-overloaded
+  // service again immediately.
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
     try {
       // eslint-disable-next-line no-await-in-loop
@@ -133,14 +201,31 @@ async function analyze({ context, language = 'en', kind = 'independent', signal 
     } catch (err) {
       lastErr = err;
       const retryable = err.isTimeout || (err.status && err.status >= 500) || (!err.status && !err.isRateLimit);
-      if (err.isRateLimit || !retryable || err.cancelled || (signal && signal.aborted) || attempt === maxRetries) {
+      const doneRetrying = err.isRateLimit || !retryable || err.cancelled || (signal && signal.aborted) || attempt === maxRetries;
+      if (doneRetrying) {
         logger.warn(`Gemini call failed (attempt ${attempt + 1}/${maxRetries + 1}): ${err.message}`);
         throw err;
       }
-      logger.warn(`Gemini call failed, retrying (attempt ${attempt + 1}/${maxRetries + 1}): ${err.message}`);
+      const delayMs = computeBackoffDelayMs(attempt, {
+        baseDelayMs: retryBaseDelayMs,
+        maxDelayMs: retryMaxDelayMs,
+        retryAfterMs: err.retryAfterMs,
+      });
+      logger.warn(`Gemini call failed, retrying in ${Math.round(delayMs)}ms (attempt ${attempt + 1}/${maxRetries + 1}): ${err.message}`);
+      // eslint-disable-next-line no-await-in-loop
+      await sleep(delayMs, signal);
+      if (signal && signal.aborted) {
+        // The workflow deadline passed while we were backing off - don't
+        // spend another attempt (and another API call) just to confirm
+        // what we already know.
+        logger.warn(`Gemini call abandoned: workflow deadline passed during backoff (attempt ${attempt + 1}/${maxRetries + 1})`);
+        throw err;
+      }
     }
   }
   throw lastErr;
 }
 
-module.exports = { analyze, buildRequestBody, parseGeminiResponseBody };
+module.exports = {
+  analyze, buildRequestBody, parseGeminiResponseBody, computeBackoffDelayMs, parseRetryAfterMs,
+};
