@@ -14,17 +14,19 @@
 //   3. This function returns the final text; index.js edits the WAITING
 //      message into it.
 //
-// Storage: NOTHING here touches Redis. The only state kept after a run is a
-// small in-process, time-limited copy of the last finished result per
-// channel, so a follow-up like "explain in Roman Urdu" or "sirf differences
-// batao" can re-format it without a new fetch or AI call. It is lost on
-// restart, which is fine for a 15-minute conversational convenience. (The
-// older Redis-backed services/analysisMemory.js and services/analysisLog.js
-// are no longer used by this command.)
+// Storage: the only Redis write here is registering a successful bot signal
+// for tracking (see registerTrackedSignal below) - everything else stays as
+// before: a small in-process, time-limited copy of the last finished result
+// per channel, so a follow-up like "explain in Roman Urdu" or "sirf
+// differences batao" can re-format it without a new fetch or AI call. That
+// part is lost on restart, which is fine for a 15-minute conversational
+// convenience. (The older Redis-backed services/analysisMemory.js and
+// services/analysisLog.js are no longer used by this command.)
 
 const { runMarketWorkflow } = require('../services/marketWorkflow');
 const { parseMarketRequest } = require('../services/nlu');
 const marketFormatting = require('../utils/marketFormatting');
+const binaryStore = require('../services/binaryStore');
 const logger = require('../utils/logger');
 
 const DEFAULT_HORIZON_MINUTES = 5;
@@ -93,6 +95,37 @@ function startHook(fn) {
     .catch((err) => logger.warn(`Waiting-message hook failed (analysis continues): ${err.message}`));
 }
 
+// ---- Tracker registration (fixes: !market signals never entered the
+// completed-trades lifecycle) ----
+// A successful bot analysis IS a real deterministic binary-style signal -
+// same shape, same checkpoints/expiry/entryPrice, produced by the exact
+// same binaryEngine.generateBinarySignal() call that !analyze <symbol>
+// <duration> and !binary already register for tracking (see
+// commands/analyze.js and commands/binary.js). !market computed and
+// displayed that same signal but never called binaryStore.saveNew() on it,
+// so it never entered services/binaryTracker.js's OPEN set, never got
+// checkpointed against real price data, never closed as WIN/LOSS, and never
+// contributed a single row to its own expiry bucket's history - which is
+// exactly why a !market report's "completed trades in this expiry bucket"
+// permanently read 0 no matter how many times it had been run.
+//
+// This reuses the EXACT SAME binaryStore.newId()/saveNew() every other
+// command uses - no parallel storage, no new schema, and nothing here
+// touches or resets any existing historical data; it only adds new rows for
+// runs from this point forward. Registration is best-effort: a store/Redis
+// failure is logged and never affects the analysis text already about to be
+// returned to Discord.
+async function registerTrackedSignal(result) {
+  if (!result || !result.bot || result.bot.status !== 'OK' || !result.bot.signal) return;
+  try {
+    const { signal } = result.bot;
+    const id = binaryStore.newId(signal.symbol);
+    await binaryStore.saveNew({ ...signal, id, status: 'OPEN', result: null });
+  } catch (err) {
+    logger.error(`!market: could not register signal for tracking (analysis result is unaffected): ${err.message}`);
+  }
+}
+
 // `deps` exists for tests: { runMarketWorkflow, workflowOptions }.
 async function handleMarketCommand(scopeId, text, hooks = {}, deps = {}) {
   const parsed = parseMarketRequest(text);
@@ -131,8 +164,11 @@ async function handleMarketCommand(scopeId, text, hooks = {}, deps = {}) {
   // The final edit must never race ahead of the WAITING message existing.
   await waiting;
 
+  await registerTrackedSignal(result);
   remember(scopeId, result, parsed);
   return marketFormatting.renderWorkflowResult(result, { intent: parsed.intent, compact: parsed.compact });
 }
 
-module.exports = { handleMarketCommand, followUpMemory, FOLLOWUP_TTL_MS };
+module.exports = {
+  handleMarketCommand, followUpMemory, FOLLOWUP_TTL_MS, registerTrackedSignal,
+};
