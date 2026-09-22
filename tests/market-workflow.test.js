@@ -5,7 +5,7 @@ const {
   makeCandles, makeInputs, deferred, sleep,
 } = require('./helpers/fixtures');
 const { makeFakeRedis } = require('./helpers/fakeRedis');
-const { makeFakeProvider } = require('../src/services/ai/fakeProvider');
+const { makeFakeProvider, makeGoodResponse, makeGoodSynthesis } = require('../src/services/ai/fakeProvider');
 const store = require('../src/services/redisStore');
 const config = require('../src/config');
 const binaryEngine = require('../src/services/binaryEngine');
@@ -227,16 +227,21 @@ test('6. no Redis WRITE happens in the workflow - only the bot\'s calibration RE
   assert.ok(redis.readCalls().length > 0, 'calibration reads still happen');
 });
 
-test('6b. the whole command path (including follow-up memory) writes nothing to Redis', async () => {
+test('6b. the whole command path registers the fresh signal for tracking once, and follow-up memory adds no further Redis writes', async () => {
   const redis = makeFakeRedis();
   store.redis = redis;
   const provider = makeFakeProvider('ok');
   const opts = { workflowOptions: { deps: { fetchInputs: async () => makeInputs({ duration: 5, count: 120 }) }, aiOptions: { providerOverride: provider } } };
   const first = await handleMarketCommand('t6b-chan', 'EURUSD 5m', {}, opts);
   assert.match(first, /MARKET RESEARCH REPORT/);
+  // The fresh analysis above registers its own signal via binaryStore.saveNew()
+  // (see commands/market.js's registerTrackedSignal) - this is the !market
+  // completed-trades fix, not a regression: exactly 3 writes (set+zadd+sadd),
+  // nothing more.
+  assert.strictEqual(redis.writeCalls().length, 3);
   const followUp = await handleMarketCommand('t6b-chan', 'sirf differences batao', {}, opts);
   assert.match(followUp, /Comparison:/);
-  assert.deepStrictEqual(redis.writeCalls(), []);
+  assert.strictEqual(redis.writeCalls().length, 3, 'a follow-up (no fresh workflow run) must add no further Redis writes');
 });
 
 test('6c. the !market path does not load the Redis-backed analysisMemory / analysisLog modules at all', () => {
@@ -559,5 +564,105 @@ test('the workflow never throws, even if every dependency explodes', async () =>
   assert.strictEqual(r2.reasonCode, 'BOTH_FAILED');
   await sleep(5);
 });
+
+// ---------------------------------------------------------------- provider-chain resilience (full workflow, real Gemini call path)
+// Unlike every test above (which injects a fake AI provider via
+// providerOverride), this one goes through the REAL analyst.js ->
+// provider.js -> geminiProvider.js path end to end - the only thing
+// stubbed is global.fetch (the raw HTTP transport). It proves the actual
+// requirement: when every configured AI provider is persistently
+// unavailable, the deterministic bot branch (the REAL binaryEngine, not a
+// stub) still completes correctly and the workflow degrades cleanly rather
+// than crashing or losing the bot's result.
+function stubFetch(handler) {
+  const calls = [];
+  const saved = global.fetch;
+  global.fetch = (url, init) => { calls.push({ url, init }); return handler(url, init, calls.length); };
+  return { calls, restore: () => { global.fetch = saved; } };
+}
+const okBody = (text = '{}') => ({ ok: true, status: 200, json: async () => ({ candidates: [{ content: { parts: [{ text }] }, finishReason: 'STOP' }] }), text: async () => '' });
+const failBody = (status, message = 'nope') => ({ ok: false, status, json: async () => ({}), text: async () => message });
+
+async function withRealGeminiChain(primaryPatch, fallbackPatch, fn) {
+  const savedPrimary = { ...config.ai.gemini };
+  const savedFallback = { ...config.ai.geminiFallback };
+  Object.assign(config.ai.gemini, primaryPatch);
+  Object.assign(config.ai.geminiFallback, fallbackPatch);
+  try { return await fn(); } finally {
+    Object.assign(config.ai.gemini, savedPrimary);
+    Object.assign(config.ai.geminiFallback, savedFallback);
+  }
+}
+
+test('provider-chain resilience: both primary and fallback persistently 503 -> real deterministic bot analysis still completes, workflow degrades cleanly', async () => {
+  const f = stubFetch(async () => failBody(503, 'The model is overloaded. Please try again later.'));
+  try {
+    await withRealGeminiChain(
+      {
+        apiKey: 'k', model: 'primary-model', maxRetries: 0, retryBaseDelayMs: 1, retryMaxDelayMs: 1,
+      },
+      {
+        apiKey: 'k', model: 'fallback-model', maxRetries: 0, retryBaseDelayMs: 1, retryMaxDelayMs: 1,
+      },
+      async () => {
+        const result = await runMarketWorkflow(REQUEST, {
+          mode: 'report', timeoutMs: 5000, deps: { fetchInputs: async () => makeInputs() },
+        });
+        // Bot branch is the REAL deterministic engine (no override) and
+        // must complete normally even though every AI provider failed.
+        assert.strictEqual(result.bot.status, 'OK');
+        assert.ok(result.bot.signal, 'deterministic bot signal must still be produced');
+        // AI branch exhausted BOTH configured providers.
+        assert.strictEqual(result.ai.status, 'ERROR');
+        assert.match(result.ai.reason, /temporarily overloaded/);
+        assert.strictEqual(result.ai.attempts.length, 2);
+        assert.deepStrictEqual(result.ai.attempts.map((a) => a.provider), ['gemini-primary', 'gemini-fallback']);
+        // Overall outcome degrades gracefully - never crashes, never drops
+        // the bot's result - and synthesis is correctly never attempted
+        // (nothing to synthesize without an independent AI analysis).
+        assert.strictEqual(result.outcome, 'DEGRADED');
+        assert.strictEqual(result.reasonCode, 'AI_UNAVAILABLE');
+        assert.strictEqual(result.synthesis, null);
+        assert.ok(result.market);
+        // Discord text must still render a complete, readable report.
+        const text = formatting.renderWorkflowResult(result, { intent: 'analyze' });
+        assert.match(text, /BOT ANALYST/i);
+      },
+    );
+    // primary: 1 attempt (maxRetries:0); fallback: 1 attempt. Synthesis is
+    // never reached, so exactly 2 fetch calls total for the whole run.
+    assert.strictEqual(f.calls.length, 2);
+  } finally { f.restore(); }
+});
+
+test('provider-chain resilience: primary 503 but fallback works -> full REPORT (independent AI + synthesis) is produced', async () => {
+  const f = stubFetch(async (url, init) => {
+    if (url.includes('/models/primary-model:')) return failBody(503, 'The model is overloaded. Please try again later.');
+    if (url.includes('/models/fallback-model:')) {
+      const prompt = JSON.parse(init.body).contents[0].parts[0].text;
+      const isSynthesis = /final research synthesizer/.test(prompt);
+      return okBody(isSynthesis ? makeGoodSynthesis() : makeGoodResponse());
+    }
+    throw new Error(`unexpected url in test: ${url}`);
+  });
+  try {
+    await withRealGeminiChain(
+      { apiKey: 'k', model: 'primary-model', maxRetries: 0 },
+      { apiKey: 'k', model: 'fallback-model', maxRetries: 0 },
+      async () => {
+        const result = await runMarketWorkflow(REQUEST, {
+          mode: 'report', timeoutMs: 5000, deps: { fetchInputs: async () => makeInputs() },
+        });
+        assert.strictEqual(result.bot.status, 'OK');
+        assert.strictEqual(result.ai.status, 'OK');
+        assert.strictEqual(result.ai.providerUsed, 'gemini-fallback');
+        assert.strictEqual(result.outcome, 'REPORT');
+        assert.ok(result.synthesis, 'synthesis should have been attempted and produced given a working fallback');
+      },
+    );
+  } finally { f.restore(); }
+});
+
+
 
 run('market workflow');
