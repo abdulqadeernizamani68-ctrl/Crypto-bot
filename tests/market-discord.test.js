@@ -5,6 +5,7 @@ const { makeCandles, sleep } = require('./helpers/fixtures');
 const { makeFakeRedis } = require('./helpers/fakeRedis');
 const { makeGoodResponse, makeGoodSynthesis } = require('../src/services/ai/fakeProvider');
 const store = require('../src/services/redisStore');
+const binaryStore = require('../src/services/binaryStore');
 const config = require('../src/config');
 const twelvedata = require('../src/services/twelvedata');
 const { handleMessage, WAITING_TEXT } = require('../src/index');
@@ -112,7 +113,17 @@ test('5c. the real chain: one shared data fetch, two Gemini calls, model comes f
   // Independent prompt never mentions the bot's output; synthesis prompt carries both analyses.
   assert.ok(!/botAnalysis|calibratedProbability|NO_TRADE/.test(geminiRequests[0].prompt));
   assert.ok(/botAnalysis/.test(geminiRequests[1].prompt) && /independentAiAnalysis/.test(geminiRequests[1].prompt));
-  assert.deepStrictEqual(redis.writeCalls(), [], 'nothing persisted to Redis');
+  // A successful bot signal is now registered for tracking (the !market
+  // completed-trades fix) - exactly binaryStore.saveNew()'s own 3 writes,
+  // nothing else.
+  const writes = redis.writeCalls();
+  assert.strictEqual(writes.length, 3, 'exactly one binaryStore.saveNew(): set + zadd + sadd');
+  assert.strictEqual(writes[0].cmd, 'set');
+  assert.ok(writes[0].args[0].startsWith('binary:signal:EURUSD-'), writes[0].args[0]);
+  assert.strictEqual(writes[1].cmd, 'zadd');
+  assert.strictEqual(writes[1].args[0], 'binary:signals:all');
+  assert.strictEqual(writes[2].cmd, 'sadd');
+  assert.strictEqual(writes[2].args[0], 'binary:signals:open');
 });
 
 test('5d. a report longer than one Discord message continues in chunks; the first chunk is still the edit', async () => {
@@ -176,13 +187,14 @@ test('5h. failure states are delivered through the same edit: INSUFFICIENT_DATA,
 });
 
 // ------------------------------------------------------- follow-ups
-test('5i. follow-ups reuse the in-process result: no WAITING message, no new fetch, no new AI call, no Redis', async () => {
+test('5i. follow-ups reuse the in-process result: no WAITING message, no new fetch, no new AI call, no new Redis writes', async () => {
   resetWorld();
   const first = makeMessage('!market EURUSD 5m', { channelId: 'follow-chan' });
   await handleMessage(first.message);
   assert.deepStrictEqual(first.log.map((l) => l.op), ['reply', 'edit']);
   const td0 = tdCalls;
   const ai0 = geminiRequests.length;
+  const writes0 = redis.writeCalls().length; // the fresh analysis above registers its own signal (binaryStore.saveNew)
 
   const second = makeMessage('!market sirf differences batao', { channelId: 'follow-chan' });
   await handleMessage(second.message);
@@ -195,7 +207,7 @@ test('5i. follow-ups reuse the in-process result: no WAITING message, no new fet
   await handleMessage(third.message);
   assert.deepStrictEqual(third.log.map((l) => l.op), ['reply']);
   assert.match(third.log[0].content, /MARKET RESEARCH REPORT/);
-  assert.deepStrictEqual(redis.writeCalls(), []);
+  assert.strictEqual(redis.writeCalls().length, writes0, 'follow-ups must not add any new Redis writes beyond the original fresh analysis');
 });
 
 test('5j. a follow-up in a channel with no previous analysis gets guidance (and no WAITING)', async () => {
@@ -249,6 +261,52 @@ test('5m. a failed run does not overwrite the last good analysis a follow-up mig
   const follow = makeMessage('!market sirf differences batao', { channelId: 'keep-chan' });
   await handleMessage(follow.message);
   assert.match(follow.log[0].content, /^\*\*Comparison:/);
+});
+
+// ------------------------------------------------------- tracker registration (completed-trades fix)
+test('!market registers a successful signal for tracking - retrievable via binaryStore, same shape as !analyze/!binary use', async () => {
+  resetWorld();
+  const { message } = makeMessage('!market EURUSD 4H');
+  await handleMessage(message);
+
+  const open = await binaryStore.getOpen();
+  assert.strictEqual(open.length, 1, 'exactly one tracked signal registered for this run');
+  const stored = open[0];
+  assert.strictEqual(stored.symbol, 'EURUSD');
+  assert.strictEqual(stored.status, 'OPEN');
+  assert.strictEqual(stored.result, null);
+  assert.ok(Array.isArray(stored.checkpoints) && stored.checkpoints.length > 0, 'checkpoints must be present for binaryTracker to resolve later');
+  assert.ok(stored.expiryBucket && stored.expiryBucket.key, 'expiryBucket must be present so this run counts toward its own bucket\'s completed-trade history');
+  assert.ok(stored.id.startsWith('EURUSD-'), stored.id);
+});
+
+test('!market does NOT register anything when there is no successful bot signal (e.g. INSUFFICIENT_DATA)', async () => {
+  resetWorld();
+  const savedTs = twelvedata.getTimeSeries;
+  twelvedata.getTimeSeries = async () => { throw new Error('Twelve Data error for EURUSD: no values returned'); };
+  try {
+    const { message, log } = makeMessage('!market EURUSD 4H');
+    await handleMessage(message);
+    assert.match(log[1].content, /INSUFFICIENT_DATA/);
+  } finally {
+    twelvedata.getTimeSeries = savedTs;
+  }
+  assert.deepStrictEqual(redis.writeCalls(), [], 'no bot signal exists, so nothing should be registered');
+  assert.deepStrictEqual(await binaryStore.getOpen(), []);
+});
+
+test('!market: a tracking-registration failure (e.g. Redis down) never breaks the delivered analysis', async () => {
+  resetWorld();
+  const savedSet = redis.set;
+  redis.set = async () => { throw new Error('simulated Redis outage'); };
+  try {
+    const { message, log } = makeMessage('!market EURUSD 4H');
+    await handleMessage(message);
+    assert.deepStrictEqual(log.map((l) => l.op), ['reply', 'edit']);
+    assert.match(log[1].content, /MARKET RESEARCH REPORT/, 'the analysis itself must still be delivered in full');
+  } finally {
+    redis.set = savedSet;
+  }
 });
 
 test('ignores bot authors and non-command messages', async () => {
