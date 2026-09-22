@@ -102,6 +102,38 @@ module.exports = {
       // cap, so a small value can leave no room for the JSON answer itself.
       maxOutputTokens: num(process.env.GEMINI_MAX_OUTPUT_TOKENS, 4096),
     },
+    // ---- Fallback Gemini model (optional, off by default) ----
+    // If GEMINI_FALLBACK_MODEL is set, the AI stages automatically try this
+    // model whenever the primary model (above) exhausts its own bounded
+    // retries (see services/ai/provider.js's getProviderChain and
+    // services/ai/analyst.js's callAndValidate) - e.g. a persistent 503
+    // "model is overloaded" on the primary model, which Google's own
+    // troubleshooting guide lists "switch to another model" as a documented
+    // mitigation for. Left unset (the default), there is NO fallback and
+    // behavior is byte-for-byte identical to before this existed: exactly
+    // one configured Gemini model, deterministic bot analysis unaffected if
+    // it's unavailable.
+    //
+    // Deliberately no hard-coded fallback model id, same reasoning as
+    // GEMINI_MODEL above - only a currently-supported id you set yourself
+    // (see https://ai.google.dev/gemini-api/docs/models), ideally a
+    // different model family/size than the primary so a capacity problem
+    // hitting one doesn't necessarily hit the other too.
+    //
+    // Everything else defaults to the primary model's own setting (same
+    // account/key, same transport tuning) so turning this on only requires
+    // setting ONE new variable; every default is independently overridable
+    // for a genuinely separate account/project.
+    geminiFallback: {
+      apiKey: process.env.GEMINI_FALLBACK_API_KEY || process.env.GEMINI_API_KEY || '',
+      model: (process.env.GEMINI_FALLBACK_MODEL || '').trim(),
+      baseUrl: process.env.GEMINI_FALLBACK_BASE_URL || process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta',
+      timeoutMs: num(process.env.GEMINI_FALLBACK_TIMEOUT_MS, num(process.env.GEMINI_TIMEOUT_MS, 60000)),
+      maxRetries: num(process.env.GEMINI_FALLBACK_MAX_RETRIES, num(process.env.GEMINI_MAX_RETRIES, 1)),
+      retryBaseDelayMs: num(process.env.GEMINI_FALLBACK_RETRY_BASE_DELAY_MS, num(process.env.GEMINI_RETRY_BASE_DELAY_MS, 1000)),
+      retryMaxDelayMs: num(process.env.GEMINI_FALLBACK_RETRY_MAX_DELAY_MS, num(process.env.GEMINI_RETRY_MAX_DELAY_MS, 8000)),
+      maxOutputTokens: num(process.env.GEMINI_FALLBACK_MAX_OUTPUT_TOKENS, num(process.env.GEMINI_MAX_OUTPUT_TOKENS, 4096)),
+    },
     // Only read by services/analysisMemory.js (the older Redis-backed
     // follow-up memory). The unified !market workflow does NOT depend on it
     // - see commands/market.js.
