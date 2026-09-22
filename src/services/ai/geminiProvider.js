@@ -20,7 +20,7 @@ const { buildPrompt, buildSynthesisPrompt } = require('./prompt');
 // job is just to make that failure clear and point at where to look, not to
 // pre-judge model ids itself.
 
-function buildRequestBody(context, language, kind = 'independent') {
+function buildRequestBody(cfg, context, language, kind = 'independent') {
   const prompt = kind === 'synthesis'
     ? buildSynthesisPrompt(context, language)
     : buildPrompt(context, language);
@@ -28,7 +28,7 @@ function buildRequestBody(context, language, kind = 'independent') {
     contents: [{ role: 'user', parts: [{ text: prompt }] }],
     generationConfig: {
       temperature: 0.2, // low - this is analysis, not creative writing
-      maxOutputTokens: config.ai.gemini.maxOutputTokens,
+      maxOutputTokens: cfg.maxOutputTokens,
       responseMimeType: 'application/json', // ask Gemini to constrain to JSON directly where supported
     },
   };
@@ -112,8 +112,8 @@ function parseGeminiResponseBody(body) {
   return { text, usage, finishReason, blocked: !!blocked, blockReason: body?.promptFeedback?.blockReason || null };
 }
 
-async function callOnce(requestBody, timeoutMs, externalSignal) {
-  const { apiKey, model, baseUrl } = config.ai.gemini;
+async function callOnce(cfg, requestBody, timeoutMs, externalSignal) {
+  const { apiKey, model, baseUrl } = cfg;
   if (!apiKey) {
     throw new Error('GEMINI_API_KEY is not set - cannot call the Gemini provider');
   }
@@ -179,11 +179,21 @@ async function callOnce(requestBody, timeoutMs, externalSignal) {
   }
 }
 
-async function analyze({ context, language = 'en', kind = 'independent', signal }) {
+// ---- Config-parametrized core ----
+// Everything above this point is stateless given a cfg object; this is the
+// one function that actually knows how to run the full call+retry cycle for
+// a given { apiKey, model, baseUrl, timeoutMs, maxRetries, retryBaseDelayMs,
+// retryMaxDelayMs } slice. `analyze()` below binds it to config.ai.gemini
+// (the primary provider, unchanged from before this file supported more
+// than one slice); createProvider() binds it to any other slice - this is
+// how a second, independently-configured Gemini call (e.g. a fallback
+// model) is built without duplicating any request/retry/backoff logic, and
+// without this module needing to know how many callers exist.
+async function analyzeWithConfig(cfg, { context, language = 'en', kind = 'independent', signal }) {
   const {
     timeoutMs, maxRetries, retryBaseDelayMs, retryMaxDelayMs,
-  } = config.ai.gemini;
-  const requestBody = buildRequestBody(context, language, kind);
+  } = cfg;
+  const requestBody = buildRequestBody(cfg, context, language, kind);
 
   let lastErr;
   // Only retry on transport-ish failures (timeout, 5xx, network) - never
@@ -196,7 +206,7 @@ async function analyze({ context, language = 'en', kind = 'independent', signal 
   for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
     try {
       // eslint-disable-next-line no-await-in-loop
-      const result = await callOnce(requestBody, timeoutMs, signal);
+      const result = await callOnce(cfg, requestBody, timeoutMs, signal);
       return result;
     } catch (err) {
       lastErr = err;
@@ -226,6 +236,24 @@ async function analyze({ context, language = 'en', kind = 'independent', signal 
   throw lastErr;
 }
 
+// Default provider instance: the primary Gemini call, reading config.ai.gemini
+// FRESH on every call (so live env/config changes and test overrides are
+// always picked up) - byte-for-byte the same behavior this function had
+// before this module supported more than one configured Gemini slice.
+function analyze(args) {
+  return analyzeWithConfig(config.ai.gemini, args);
+}
+
+// Builds an independent provider instance bound to another config slice
+// (e.g. config.ai.geminiFallback) - same request building, same bounded
+// retry+backoff, same error handling, just pointed at a different
+// model/key/baseUrl. `getCfg` is called fresh on every analyze() so runtime
+// config changes (and test overrides) are honored the same way the default
+// export already honors them for the primary slice.
+function createProvider(getCfg) {
+  return { analyze: (args) => analyzeWithConfig(getCfg(), args) };
+}
+
 module.exports = {
-  analyze, buildRequestBody, parseGeminiResponseBody, computeBackoffDelayMs, parseRetryAfterMs,
+  analyze, createProvider, buildRequestBody, parseGeminiResponseBody, computeBackoffDelayMs, parseRetryAfterMs,
 };
