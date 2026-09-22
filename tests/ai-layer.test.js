@@ -28,6 +28,12 @@ async function withGemini(patch, fn) {
   try { return await fn(); } finally { Object.assign(config.ai.gemini, saved); }
 }
 
+async function withGeminiFallback(patch, fn) {
+  const saved = { ...config.ai.geminiFallback };
+  Object.assign(config.ai.geminiFallback, patch);
+  try { return await fn(); } finally { Object.assign(config.ai.geminiFallback, saved); }
+}
+
 async function realSignal(overrides = {}) {
   const inputs = makeInputs();
   const signal = await binaryEngine.generateBinarySignal(inputs.symbol, inputs.duration, inputs);
@@ -515,6 +521,135 @@ test('a persistent 503 (retries exhausted) is reported cleanly and never blames 
       assert.doesNotMatch(r.reason, /rotate|regenerate|invalid api key|check your (api )?key/i);
       assert.strictEqual(r.analysis, null); // no AI opinion...
     });
+  } finally { f.restore(); }
+});
+
+// ================================================================ provider chain (fallback resilience)
+// These exercise the REAL provider.getProviderChain()/analyst.callAndValidate
+// path end to end - no providerOverride, no faked business logic. The only
+// thing stubbed is global.fetch (the raw HTTP transport), exactly like every
+// other geminiProvider test above; the request building, retry/backoff,
+// chain iteration, JSON extraction and schema validation are all real code.
+test('provider chain: with no GEMINI_FALLBACK_MODEL set, the chain has exactly one entry (unchanged behavior)', async () => {
+  assert.strictEqual(config.ai.geminiFallback.model, '', 'test assumes no fallback is configured by default');
+  const chain = provider.getProviderChain();
+  assert.strictEqual(chain.length, 1);
+  assert.strictEqual(chain[0].name, 'gemini-primary');
+});
+
+test('provider chain: persistent primary 503 automatically falls back to the configured fallback model', async () => {
+  const f = stubFetch(async (url) => {
+    if (url.includes('/models/primary-model:')) return failBody(503, 'The model is overloaded. Please try again later.');
+    if (url.includes('/models/fallback-model:')) return okBody(makeGoodResponse());
+    throw new Error(`unexpected url in test: ${url}`);
+  });
+  try {
+    await withGemini({
+      apiKey: 'k', model: 'primary-model', maxRetries: 1, retryBaseDelayMs: 1, retryMaxDelayMs: 1,
+    }, () => withGeminiFallback({
+      apiKey: 'k', model: 'fallback-model', maxRetries: 1, retryBaseDelayMs: 1, retryMaxDelayMs: 1,
+    }, async () => {
+      const r = await analyst.runIndependentAnalysis(makeInputs());
+      assert.strictEqual(r.status, 'OK');
+      assert.strictEqual(r.providerUsed, 'gemini-fallback');
+      assert.strictEqual(r.attempts.length, 2);
+      assert.strictEqual(r.attempts[0].provider, 'gemini-primary');
+      assert.strictEqual(r.attempts[0].status, 'ERROR');
+      assert.strictEqual(r.attempts[1].provider, 'gemini-fallback');
+      assert.strictEqual(r.attempts[1].status, 'OK');
+    }));
+    // primary: maxRetries=1 -> 2 HTTP attempts; fallback: succeeds on the first.
+    assert.strictEqual(f.calls.filter((c) => c.url.includes('primary-model')).length, 2);
+    assert.strictEqual(f.calls.filter((c) => c.url.includes('fallback-model')).length, 1);
+  } finally { f.restore(); }
+});
+
+test('provider chain: primary timeout falls back to the fallback model', async () => {
+  const f = stubFetch(async (url, init) => {
+    if (url.includes('/models/primary-model:')) return hangUntilAborted(url, init);
+    if (url.includes('/models/fallback-model:')) return okBody(makeGoodResponse());
+    throw new Error(`unexpected url in test: ${url}`);
+  });
+  try {
+    await withGemini({
+      apiKey: 'k', model: 'primary-model', maxRetries: 0, timeoutMs: 30,
+    }, () => withGeminiFallback({ apiKey: 'k', model: 'fallback-model' }, async () => {
+      const r = await analyst.runIndependentAnalysis(makeInputs());
+      assert.strictEqual(r.status, 'OK');
+      assert.strictEqual(r.providerUsed, 'gemini-fallback');
+      assert.strictEqual(r.attempts[0].status, 'TIMEOUT');
+    }));
+  } finally { f.restore(); }
+});
+
+test('provider chain: malformed JSON from primary falls back; fallback returns a valid response', async () => {
+  const f = stubFetch(async (url) => {
+    if (url.includes('/models/primary-model:')) return okBody('this is not valid json at all');
+    if (url.includes('/models/fallback-model:')) return okBody(makeGoodResponse());
+    throw new Error(`unexpected url in test: ${url}`);
+  });
+  try {
+    await withGemini({ apiKey: 'k', model: 'primary-model', maxRetries: 0 }, () => withGeminiFallback({ apiKey: 'k', model: 'fallback-model' }, async () => {
+      const r = await analyst.runIndependentAnalysis(makeInputs());
+      assert.strictEqual(r.status, 'OK');
+      assert.strictEqual(r.providerUsed, 'gemini-fallback');
+      assert.match(r.attempts[0].reason, /malformed response/);
+    }));
+  } finally { f.restore(); }
+});
+
+test('provider chain: both primary and fallback persistently unavailable (503) -> clean ERROR, nothing thrown, bot unaffected downstream', async () => {
+  const f = stubFetch(async () => failBody(503, 'The model is overloaded. Please try again later.'));
+  try {
+    await withGemini({
+      apiKey: 'k', model: 'primary-model', maxRetries: 0, retryBaseDelayMs: 1, retryMaxDelayMs: 1,
+    }, () => withGeminiFallback({
+      apiKey: 'k', model: 'fallback-model', maxRetries: 0, retryBaseDelayMs: 1, retryMaxDelayMs: 1,
+    }, async () => {
+      const r = await analyst.runIndependentAnalysis(makeInputs());
+      assert.strictEqual(r.status, 'ERROR');
+      assert.match(r.reason, /temporarily overloaded/);
+      assert.strictEqual(r.analysis, null);
+      assert.strictEqual(r.attempts.length, 2);
+      assert.deepStrictEqual(r.attempts.map((a) => a.provider), ['gemini-primary', 'gemini-fallback']);
+      assert.ok(r.attempts.every((a) => a.status === 'ERROR'));
+    }));
+  } finally { f.restore(); }
+});
+
+test('provider chain: a workflow-deadline cancellation stops the chain - the fallback is never even tried', async () => {
+  let fallbackHit = false;
+  const f = stubFetch(async (url, init) => {
+    if (url.includes('fallback-model')) fallbackHit = true;
+    return hangUntilAborted(url, init);
+  });
+  try {
+    await withGemini({
+      apiKey: 'k', model: 'primary-model', maxRetries: 3, timeoutMs: 5000,
+    }, () => withGeminiFallback({ apiKey: 'k', model: 'fallback-model' }, async () => {
+      const ac = new AbortController();
+      setTimeout(() => ac.abort(), 20);
+      const r = await analyst.runIndependentAnalysis(makeInputs(), { signal: ac.signal });
+      assert.strictEqual(r.status, 'TIMEOUT');
+    }));
+    assert.strictEqual(fallbackHit, false, 'no point trying another provider once the caller\'s own deadline is gone');
+  } finally { f.restore(); }
+});
+
+test('provider chain: independence is preserved across a fallback - the fallback call receives the same bot-blind context', async () => {
+  const seenPrompts = [];
+  const f = stubFetch(async (url, init) => {
+    seenPrompts.push(JSON.parse(init.body).contents[0].parts[0].text);
+    if (url.includes('/models/primary-model:')) return failBody(503, 'The model is overloaded. Please try again later.');
+    return okBody(makeGoodResponse());
+  });
+  try {
+    await withGemini({ apiKey: 'k', model: 'primary-model', maxRetries: 0 }, () => withGeminiFallback({ apiKey: 'k', model: 'fallback-model' }, async () => {
+      await analyst.runIndependentAnalysis(makeInputs());
+    }));
+    assert.strictEqual(seenPrompts.length, 2);
+    assert.strictEqual(seenPrompts[0], seenPrompts[1], 'the fallback must see the exact same independent-analysis prompt as the primary - never the bot\'s conclusion');
+    assert.doesNotMatch(seenPrompts[1], /NO_TRADE|calibratedProbability|expiryBucket/, 'the independent-analysis prompt must never carry the bot\'s own output fields');
   } finally { f.restore(); }
 });
 
