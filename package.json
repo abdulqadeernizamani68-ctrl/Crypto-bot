@@ -1,1 +1,24 @@
-
+{
+  "name": "binary-signal-bot",
+  "version": "2.0.0",
+  "description": "Binary/time-based options signal bot (Discord) - deterministic multi-factor confluence engine (trend, momentum, structure, S/R, volume, divergence, regime, MTF) on live Twelve Data feeds. Analysis/research only, no auto-trading, no AI dependency.",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/index.js",
+    "backtest": "node src/backtest/run.js",
+    "test": "node tests/run-all.js"
+  },
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dependencies": {
+    "discord.js": "^14.16.3",
+    "@upstash/redis": "^1.34.0",
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.5",
+    "express": "^4.21.0",
+    "node-cron": "^3.0.3",
+    "technicalindicators": "^3.1.0"
+  }
+}
