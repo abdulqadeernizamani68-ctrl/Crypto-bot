@@ -22,6 +22,7 @@ function regimeLine(regime) {
 function formatBinarySignalMessage(signal, opts = {}) {
   const durationLabel = binaryEngine.formatMinutes(signal.durationMinutes);
   const expiryPerf = opts.expiryPerf;
+  const priceAccuracy = opts.priceAccuracy;
 
   const lines = [
     `*${signal.symbol} - Binary/Time-based Signal*`,
@@ -29,6 +30,7 @@ function formatBinarySignalMessage(signal, opts = {}) {
     `Direction: *${signal.direction}*${signal.direction === 'NO_TRADE' ? ' (no trade taken)' : ''}`,
     `Entry Price: ${fmtNum(signal.entryPrice)}`,
     `Expiry: ${durationLabel} (bucket: ${signal.expiryBucket.label})`,
+    `Expires At: ${signal.expiresAtIso} (exact expiry timestamp - the binary result is decided by price AT this instant, not before)`,
     `Market Regime: ${regimeLine(signal.regime)}`,
     '',
     `Model (raw) Probability: ${signal.rawProbability}% - this is what the drift/volatility math computed, NOT a claim about real-world accuracy`,
@@ -48,6 +50,15 @@ function formatBinarySignalMessage(signal, opts = {}) {
     lines.push(`Historical Accuracy (${signal.expiryBucket.label} expiries): no completed trades yet in this bucket`);
   }
 
+  if (priceAccuracy && priceAccuracy.sampleSize > 0) {
+    lines.push(
+      `Expiry-Price Accuracy (${signal.expiryBucket.label}, real settled trades): bias ${priceAccuracy.biasPct >= 0 ? '+' : ''}${priceAccuracy.biasPct}%, avg error ${priceAccuracy.maePct}%` +
+      ` (n=${priceAccuracy.sampleSize}${priceAccuracy.lowConfidence ? ', still building - provisional' : ''})`
+    );
+  } else {
+    lines.push(`Expiry-Price Accuracy (${signal.expiryBucket.label}): no settled trades yet to compare predicted vs actual expiry price`);
+  }
+
   lines.push(`Confidence/Quality: ${signal.qualityLabel}${signal.highTrust ? ' 🔥 HIGH-TRUST SETUP' : ''}`);
 
   if (signal.direction === 'NO_TRADE') {
@@ -60,7 +71,8 @@ function formatBinarySignalMessage(signal, opts = {}) {
     const finalCp = signal.checkpoints[signal.checkpoints.length - 1];
     lines.push(
       '',
-      `Predicted at expiry: price will be *${signal.direction}* entry, around **${fmtNum(finalCp.predictedPrice)}** (likely range ${fmtNum(finalCp.rangeLow)} - ${fmtNum(finalCp.rangeHigh)})`
+      `Expected Expiry Price: **${fmtNum(signal.expectedExpiryPrice)}** (likely range ${fmtNum(finalCp.rangeLow)} - ${fmtNum(finalCp.rangeHigh)})`,
+      `Expected Move: ${signal.expectedMoveAmount >= 0 ? '+' : ''}${fmtNum(signal.expectedMoveAmount)} (${signal.expectedMovePct >= 0 ? '+' : ''}${signal.expectedMovePct}%) from entry, direction *${signal.direction}*`
     );
   }
 
@@ -184,6 +196,17 @@ function formatBinaryStatsMessage(stats) {
     });
   } else {
     lines.push('', 'Win rate by expiry length: no completed trades yet.');
+  }
+
+  if (stats.expiryPriceAccuracy?.length) {
+    const withSamples = stats.expiryPriceAccuracy.filter((p) => p.sampleSize > 0);
+    if (withSamples.length) {
+      lines.push('', 'Expected vs actual expiry price - bias/error by expiry length (separate from win rate above):');
+      withSamples.forEach((p) => {
+        const flag = p.lowConfidence ? ' (small sample)' : '';
+        lines.push(`- ${p.label}: bias ${p.biasPct >= 0 ? '+' : ''}${p.biasPct}%, avg error ${p.maePct}% (n=${p.sampleSize})${flag}`);
+      });
+    }
   }
 
   if (stats.regimePerf?.length) {
