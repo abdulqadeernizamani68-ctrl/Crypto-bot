@@ -61,91 +61,20 @@ module.exports = {
 
   // Bumped whenever the deterministic engine's scoring/gating logic
   // changes in a way that would make old backtest/calibration results not
-  // directly comparable to new ones - stored on every analysis record
-  // (see analysisLog.js) and shown in backtest output, per the
-  // "parameter/version tracking" requirement.
+  // directly comparable to new ones - per the "parameter/version
+  // tracking" requirement. (Not currently read anywhere in src/ - kept for
+  // backtest CLI output / manual reference only.)
   analyticsVersion: 'binary-engine-v3',
 
-  // ---- AI provider (independent analyst + final synthesis - see services/ai/) ----
-  // Never hard-code a key or a model here; everything comes from the
-  // environment. AI_PROVIDER selects the implementation (see
-  // services/ai/provider.js); only 'gemini' exists today, but the
-  // abstraction is provider-agnostic so a second one can be added without
-  // touching the analyst/comparison code that calls it.
-  ai: {
-    provider: (process.env.AI_PROVIDER || 'gemini').toLowerCase(),
-    gemini: {
-      apiKey: process.env.GEMINI_API_KEY || '',
-      // Deliberately NO default model: Gemini model ids get deprecated, and
-      // a hard-coded default silently turns into a 404 the day that
-      // happens. Set GEMINI_MODEL to a currently supported model id. With
-      // it unset, the AI stages report "unavailable (GEMINI_MODEL is not
-      // set)" instead of calling a stale model - the deterministic bot
-      // analysis is unaffected.
-      model: (process.env.GEMINI_MODEL || '').trim(),
-      baseUrl: process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta',
-      // Per HTTP attempt. A !market run makes two sequential-in-effect
-      // Gemini calls (independent analysis, then final synthesis) and users
-      // are expected to wait 30s-2min, so this is far more generous than
-      // the old 15s single-call default.
-      timeoutMs: num(process.env.GEMINI_TIMEOUT_MS, 60000),
-      maxRetries: num(process.env.GEMINI_MAX_RETRIES, 1),
-      // Bounded exponential backoff between retries (see geminiProvider.js's
-      // computeBackoffDelayMs) - e.g. attempt 0 waits up to ~1s, attempt 1 up
-      // to ~2s, etc, jittered, capped at retryMaxDelayMs regardless of how
-      // many retries or what a Retry-After header says. Per Google's own
-      // guidance (https://ai.google.dev/gemini-api/docs/troubleshooting) for
-      // handling 429/5xx errors including 503 UNAVAILABLE.
-      retryBaseDelayMs: num(process.env.GEMINI_RETRY_BASE_DELAY_MS, 1000),
-      retryMaxDelayMs: num(process.env.GEMINI_RETRY_MAX_DELAY_MS, 8000),
-      // Newer Gemini models count internal "thinking" tokens against this
-      // cap, so a small value can leave no room for the JSON answer itself.
-      maxOutputTokens: num(process.env.GEMINI_MAX_OUTPUT_TOKENS, 4096),
-    },
-    // ---- Fallback Gemini model (optional, off by default) ----
-    // If GEMINI_FALLBACK_MODEL is set, the AI stages automatically try this
-    // model whenever the primary model (above) exhausts its own bounded
-    // retries (see services/ai/provider.js's getProviderChain and
-    // services/ai/analyst.js's callAndValidate) - e.g. a persistent 503
-    // "model is overloaded" on the primary model, which Google's own
-    // troubleshooting guide lists "switch to another model" as a documented
-    // mitigation for. Left unset (the default), there is NO fallback and
-    // behavior is byte-for-byte identical to before this existed: exactly
-    // one configured Gemini model, deterministic bot analysis unaffected if
-    // it's unavailable.
-    //
-    // Deliberately no hard-coded fallback model id, same reasoning as
-    // GEMINI_MODEL above - only a currently-supported id you set yourself
-    // (see https://ai.google.dev/gemini-api/docs/models), ideally a
-    // different model family/size than the primary so a capacity problem
-    // hitting one doesn't necessarily hit the other too.
-    //
-    // Everything else defaults to the primary model's own setting (same
-    // account/key, same transport tuning) so turning this on only requires
-    // setting ONE new variable; every default is independently overridable
-    // for a genuinely separate account/project.
-    geminiFallback: {
-      apiKey: process.env.GEMINI_FALLBACK_API_KEY || process.env.GEMINI_API_KEY || '',
-      model: (process.env.GEMINI_FALLBACK_MODEL || '').trim(),
-      baseUrl: process.env.GEMINI_FALLBACK_BASE_URL || process.env.GEMINI_BASE_URL || 'https://generativelanguage.googleapis.com/v1beta',
-      timeoutMs: num(process.env.GEMINI_FALLBACK_TIMEOUT_MS, num(process.env.GEMINI_TIMEOUT_MS, 60000)),
-      maxRetries: num(process.env.GEMINI_FALLBACK_MAX_RETRIES, num(process.env.GEMINI_MAX_RETRIES, 1)),
-      retryBaseDelayMs: num(process.env.GEMINI_FALLBACK_RETRY_BASE_DELAY_MS, num(process.env.GEMINI_RETRY_BASE_DELAY_MS, 1000)),
-      retryMaxDelayMs: num(process.env.GEMINI_FALLBACK_RETRY_MAX_DELAY_MS, num(process.env.GEMINI_RETRY_MAX_DELAY_MS, 8000)),
-      maxOutputTokens: num(process.env.GEMINI_FALLBACK_MAX_OUTPUT_TOKENS, num(process.env.GEMINI_MAX_OUTPUT_TOKENS, 4096)),
-    },
-    // Only read by services/analysisMemory.js (the older Redis-backed
-    // follow-up memory). The unified !market workflow does NOT depend on it
-    // - see commands/market.js.
-    memoryTtlMinutes: num(process.env.AI_MEMORY_TTL_MIN, 15),
-  },
-
   // ---- Unified !market research workflow (services/marketWorkflow.js) ----
+  // AI (Gemini) has been fully removed from this project - !market is a
+  // deterministic-only workflow now (fetch data once, run the same
+  // binaryEngine the !binary command uses). No AI provider, API key, or
+  // model configuration exists anywhere in this codebase.
   market: {
-    // Hard ceiling for one whole !market run (data fetch + bot + independent
-    // AI + final synthesis). When it is hit, in-flight Gemini calls are
-    // aborted and whatever finished is reported honestly (or a concise
-    // timeout state if nothing did).
+    // Hard ceiling for one whole !market run (data fetch + deterministic
+    // bot analysis). When it is hit, the run is reported as a timeout
+    // rather than left hanging.
     workflowTimeoutMs: num(process.env.MARKET_WORKFLOW_TIMEOUT_MS, 120000),
   },
 };
