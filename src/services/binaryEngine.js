@@ -709,7 +709,7 @@ async function generateBinarySignal(symbolRaw, durationMinutes, prefetchedInputs
   const {
     driftPerMin, volPerMin, dataQuality, volumeState, candleQuality, divergences, session,
     structureInfo, srLevels, nearestSR, breakoutInfo, regimeInfo,
-    timeframeSuggestion, nativeConfluence, mtf, tilt, checkpoints, featureFlags, rawDirection, rawProbability,
+    timeframeSuggestion, nativeConfluence, mtf, tilt, checkpoints, finalCp, featureFlags, rawDirection, rawProbability,
   } = core;
 
   const expiryBucket = expiryBucketsSvc.getExpiryBucket(duration);
@@ -761,6 +761,21 @@ async function generateBinarySignal(symbolRaw, durationMinutes, prefetchedInputs
     ? 'NO_TRADE'
     : qualityScore >= 3 ? 'HIGH' : qualityScore >= 2 ? 'MEDIUM' : 'LOW';
 
+  // ---- ENTRY PRICE -> EXACT EXPIRY TIMESTAMP -> EXPECTED EXPIRY PRICE ----
+  // The whole point of a binary/time-based signal: what does the model
+  // expect price to BE at the exact moment this trade expires, not what it
+  // does in between. finalCp (fraction 1.0 of `checkpoints`, computed in
+  // computeSignalCore above) already IS the expiry-moment projection - these
+  // are just its values surfaced as explicit, clearly-named top-level
+  // fields rather than requiring every caller to dig into checkpoints[].
+  const signalTime = Date.now();
+  const expiresAtMs = signalTime + Math.round(duration * 60000);
+  const expectedExpiryPrice = finalCp.predictedPrice;
+  const expectedMoveAmount = Number.isFinite(expectedExpiryPrice) ? Number((expectedExpiryPrice - entryPrice).toPrecision(8)) : null;
+  const expectedMovePct = Number.isFinite(expectedExpiryPrice) && entryPrice > 0
+    ? Number((((expectedExpiryPrice - entryPrice) / entryPrice) * 100).toFixed(4))
+    : null;
+
   return {
     symbol: symbolRaw.toUpperCase(),
     entryPrice,
@@ -811,7 +826,15 @@ async function generateBinarySignal(symbolRaw, durationMinutes, prefetchedInputs
     featureFlags,
     timeframeSuggestion,
     checkpoints,
-    signalTime: Date.now(),
+    finalCheckpoint: finalCp,
+    signalTime,
+    expiresAtMs,
+    expiresAtIso: new Date(expiresAtMs).toISOString(),
+    expectedExpiryPrice,
+    expectedMoveAmount,
+    expectedMovePct,
+    expectedRangeLow: finalCp.rangeLow,
+    expectedRangeHigh: finalCp.rangeHigh,
   };
 }
 
