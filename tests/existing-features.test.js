@@ -5,12 +5,9 @@ const path = require('path');
 const { test, run } = require('./testKit');
 const { makeCandles, makeInputs } = require('./helpers/fixtures');
 const { makeFakeRedis } = require('./helpers/fakeRedis');
-const { makeFakeProvider } = require('../src/services/ai/fakeProvider');
 const store = require('../src/services/redisStore');
 const twelvedata = require('../src/services/twelvedata');
 const binaryEngine = require('../src/services/binaryEngine');
-const analyst = require('../src/services/ai/analyst');
-const { compareAnalyses } = require('../src/services/ai/comparison');
 const formatting = require('../src/utils/marketFormatting');
 const { parseMarketRequest } = require('../src/services/nlu');
 const { routeCommand, handleMessage } = require('../src/index');
@@ -42,7 +39,12 @@ function makeMessage(text) {
   };
 }
 
-const withoutTime = (signal) => { const { signalTime, ...rest } = signal; return rest; };
+const withoutTime = (signal) => {
+  const {
+    signalTime, expiresAtMs, expiresAtIso, ...rest
+  } = signal;
+  return rest;
+};
 
 // ---------------------------------------------------------------- 12: analytics engine
 test('12. fetchSignalInputs returns RAW inputs only (no indicator, score or conclusion)', async () => {
@@ -133,8 +135,15 @@ test('12g. "!binary" is unchanged: replies (never edits), no WAITING message, sa
   assert.match(log[0].content, /Direction: \*(UP|DOWN|NO_TRADE)\*/);
   assert.ok(log.every((l, i) => i === 0 || l.op === 'channel.send'), 'only overflow continues in follow-up chunks');
   assert.ok(log.every((l) => l.content.length <= 2000));
-  // nothing lost or altered by delivery (whitespace at chunk boundaries aside)
-  assert.strictEqual(log.map((l) => l.content).join('\n').replace(/\s+/g, ' '), expected.replace(/\s+/g, ' '));
+  // nothing lost or altered by delivery (whitespace at chunk boundaries
+  // aside; the exact expiry timestamp is real-time-dependent, computed as
+  // signalTime + duration - so it legitimately differs by a few ms between
+  // the two independent calls above and is stripped before comparing)
+  const stripTimestamp = (s) => s.replace(/Expires At: [^(]+\(/g, 'Expires At: <ts> (');
+  assert.strictEqual(
+    stripTimestamp(log.map((l) => l.content).join('\n')).replace(/\s+/g, ' '),
+    stripTimestamp(expected).replace(/\s+/g, ' '),
+  );
 });
 
 test('12g2. any reply that already fits in one Discord message (<= 2000 chars) is still sent as exactly one message', async () => {
@@ -169,35 +178,40 @@ test('12i. unknown commands are ignored; "!market" with nothing usable gives gui
 });
 
 // ---------------------------------------------------------------- 12: pre-existing formatters + kept modules
-test('12j. the pre-existing !market layouts still render (used for views, follow-ups and the degraded fallback)', async () => {
+test('12j. the deterministic !market layouts still render (views + follow-ups; AI comparison removed)', async () => {
   resetWorld();
   const inputs = makeInputs({ duration: 30, count: 825 });
   const signal = await binaryEngine.generateBinarySignal(inputs.symbol, inputs.duration, inputs);
-  const ai = await analyst.runIndependentAnalysis(inputs, { providerOverride: makeFakeProvider('ok') });
-  const comparison = compareAnalyses(signal, ai);
+  const bot = { status: 'OK', signal, expiryPerf: { total: 0, winRatePct: null, label: '30 min' } };
+  const { summarizeMarket } = require('../src/services/marketSummary');
+  const market = summarizeMarket(inputs);
 
-  const full = formatting.formatMarketAnalysis(signal, ai, comparison, { expiryPerf: { total: 0, winRatePct: null, label: '30 min' } });
-  ['**MARKET ANALYSIS**', '**BOT ANALYST**', '**AI ANALYST**', '**COMPARISON**', '**RESEARCH SUMMARY**', '**AI EXPLANATION**'].forEach((h) => assert.ok(full.includes(h), h));
-  assert.match(formatting.formatMarketAnalysis(signal, ai, comparison, { compact: true }), /^\*\*EURUSD\*\* \(30min\)/);
-  assert.match(formatting.formatDifferencesOnly(comparison), /^\*\*Comparison: /);
-  assert.match(formatting.formatReasoningOnly(signal, ai), /^\*\*Reasoning\*\*/);
+  const full = formatting.formatFullReport({ market, bot });
+  ['**MARKET RESEARCH REPORT**', 'Binary/Time-based Signal'].forEach((h) => assert.ok(full.includes(h), h));
+  assert.match(formatting.formatCompactReport({ market, bot }), /^\*\*EURUSD\*\* \(30 min\)/);
+  assert.match(formatting.formatNoComparisonAvailable(signal), /AI-based comparison has been removed/);
+  assert.match(formatting.formatReasoningOnly(signal), /^\*\*Reasoning\*\*/);
   assert.match(formatting.formatDataQualityOnly(signal), /^\*\*Data Quality - EURUSD\*\*/);
   assert.ok(formatting.botStatusLine(signal).length > 0);
-  assert.ok(formatting.aiStatusLine(ai).length > 0);
 });
 
-test('12k. analysisMemory.js and analysisLog.js are NOT deleted (still loadable, API intact) - just no longer used by !market', () => {
-  const mem = require('../src/services/analysisMemory');
-  const log = require('../src/services/analysisLog');
-  assert.deepStrictEqual(Object.keys(mem).sort(), ['getLastAnalysis', 'saveLastAnalysis']);
-  assert.deepStrictEqual(Object.keys(log).sort(), ['getRecentAnalyses', 'logAnalysis']);
+test('12k. AI/Gemini modules and dead AI-only logging modules have been fully removed', () => {
+  ['../src/services/ai/analyst', '../src/services/ai/comparison', '../src/services/ai/geminiProvider',
+    '../src/services/ai/provider', '../src/services/ai/fakeProvider', '../src/services/ai/prompt',
+    '../src/services/ai/schema', '../src/services/ai/marketContext',
+    '../src/services/analysisMemory', '../src/services/analysisLog'].forEach((mod) => {
+    assert.throws(() => require(mod), /Cannot find module/, `${mod} should no longer exist`);
+  });
+  assert.strictEqual(fs.existsSync(path.join(ROOT, 'src', 'services', 'ai')), false, 'src/services/ai/ directory should be gone');
 });
 
-test('12l. no new runtime dependencies were added; npm test is wired to the suite', () => {
+test('12l. no Gemini/AI runtime dependency or config remains; npm test is wired to the suite', () => {
   const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
   assert.deepStrictEqual(Object.keys(pkg.dependencies).sort(), ['@upstash/redis', 'axios', 'discord.js', 'dotenv', 'express', 'node-cron', 'technicalindicators']);
   assert.strictEqual(pkg.scripts.test, 'node tests/run-all.js');
   assert.strictEqual(pkg.scripts.start, 'node src/index.js');
+  const config = require('../src/config');
+  assert.strictEqual(config.ai, undefined, 'config.ai must not exist - AI has been fully removed');
 });
 
 test('12m. src/index.js does not auto-start when required (only when run directly)', () => {
