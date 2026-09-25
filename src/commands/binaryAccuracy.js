@@ -31,9 +31,12 @@ async function handleBinaryAccuracyCommand() {
     const regimePerf = await calibrationSvc.getAllRegimePerf();
     const sessionPerf = await calibrationSvc.getAllSessionPerf();
     const featurePerf = await calibrationSvc.getAllFeaturePerf();
+    const expiryPriceAccuracy = await calibrationSvc.getAllExpiryPriceAccuracy();
 
     const parts = [
-      formatBinaryStatsMessage({ totalSignals, wins, losses, winRate, checkpointAccuracy, expiryPerf, regimePerf, sessionPerf, featurePerf }),
+      formatBinaryStatsMessage({
+        totalSignals, wins, losses, winRate, checkpointAccuracy, expiryPerf, regimePerf, sessionPerf, featurePerf, expiryPriceAccuracy,
+      }),
     ];
 
     const recent = await binaryStore.getRecent(5);
