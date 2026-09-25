@@ -51,10 +51,15 @@ async function handleBinaryCommand(argText) {
     }
 
     // Real historical accuracy for THIS expiry bucket, shown alongside the
-    // model's own probability - separate numbers, never blended.
+    // model's own probability - separate numbers, never blended. Plus the
+    // separate expected-expiry-price vs actual-expiry-price bias/error
+    // validation (calibration.js) - a directionally-right bucket can still
+    // have a systematically biased price target, and that would never show
+    // up in win-rate alone.
     const expiryPerf = await calibrationSvc.getExpiryPerf(signal.expiryBucket.key);
+    const priceAccuracy = await calibrationSvc.getExpiryPriceAccuracy(signal.expiryBucket.key);
 
-    return formatBinarySignalMessage(signal, { expiryPerf });
+    return formatBinarySignalMessage(signal, { expiryPerf, priceAccuracy });
   } catch (err) {
     logger.error('binary command failed:', err.message);
     return `Could not generate a binary signal for ${parsed.symbol}: ${err.message}`;
