@@ -119,6 +119,19 @@ async function checkOpenBinary(signal) {
         if (signal.session?.session) {
           await calibrationSvc.recordSessionPerf(signal.session.session, correct);
         }
+        // Expected-expiry-price vs actual-expiry-price bias/error - a
+        // SEPARATE validation from the direction win/loss above. Only
+        // recorded when the signal actually carries a price target
+        // (older persisted signals from before this field existed won't,
+        // and are simply skipped here rather than poisoning the stat with
+        // a null/zero).
+        if (Number.isFinite(signal.expectedExpiryPrice) && Number.isFinite(finalOutcome.priceAt) && signal.entryPrice > 0) {
+          await calibrationSvc.recordExpiryPriceAccuracy(expiryBucketKey, {
+            entryPrice: signal.entryPrice,
+            predictedPrice: signal.expectedExpiryPrice,
+            actualPrice: finalOutcome.priceAt,
+          });
+        }
         // Feature-importance tracking (#16): each known boolean feature
         // flag gets its OWN outcome key ("<flag>:true" / "<flag>:false"),
         // so getAllFeaturePerf() can later show real win rate WITH vs.
