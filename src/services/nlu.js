@@ -1,8 +1,9 @@
 // ---- Deterministic natural-language command parser ----
 // Maps free-form text ("EURUSD analyse karo", "Roman Urdu mein samjhao",
-// "bot aur AI ka comparison dikhao") to a safe, fully deterministic
-// internal request object - NO AI call is spent on parsing intent
-// (deliberate cost-control choice, section Q: minimize Gemini usage).
+// "reasoning batao") to a safe, fully deterministic internal request
+// object - this project has no AI/LLM call anywhere, so intent parsing has
+// always had to be, and remains, plain regex/keyword matching, not a
+// language model.
 // This is regex/keyword-based, not a language model, so it will miss
 // unusual phrasings - documented as a known limitation in the README
 // rather than hidden. It supports English, Roman Urdu, and mixed input
