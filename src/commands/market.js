@@ -1,8 +1,9 @@
 // ---- !market command: unified research workflow entry point ----
 // Orchestration only - every real piece of logic lives in its own module:
 //   services/nlu.js            deterministic parsing of the free-text request
-//   services/marketWorkflow.js Bot + independent AI in parallel -> final
-//                              synthesis (one temporary in-memory state per run)
+//   services/marketWorkflow.js fetches data once, runs the deterministic bot
+//                              (one temporary in-memory state per run) - no
+//                              AI stage; see marketWorkflow.js header
 //   utils/marketFormatting.js  turns the workflow result into Discord text
 //
 // UX contract (the Discord side lives in src/index.js):
@@ -36,7 +37,7 @@ const FOLLOWUP_MAX_ENTRIES = 200;
 // scopeId (Discord channel id) -> { result, language, savedAt }
 const followUpMemory = new Map();
 
-const REMEMBERED_OUTCOMES = new Set(['REPORT', 'DEGRADED', 'ANALYSES']);
+const REMEMBERED_OUTCOMES = new Set(['REPORT']);
 
 function remember(scopeId, result, parsed) {
   // A failed run (no data / timeout / error) must not clobber the last good
@@ -62,28 +63,12 @@ function recall(scopeId) {
   return rec;
 }
 
-// Explicit narrower views skip the synthesis call (and, for data quality,
-// the AI entirely) - nobody would read it. Everything else is the full
-// unified workflow.
-function modeFor(intent) {
-  switch (intent) {
-    case 'compare':
-    case 'differences-only':
-    case 'reasoning':
-      return 'comparison';
-    case 'dataquality':
-      return 'dataquality';
-    default:
-      return 'report';
-  }
-}
-
 function formatFromMemory(record, parsed) {
   const view = marketFormatting.formatAnalysesView(record.result, parsed.intent);
   if (view) return view;
   let note = '';
   if (parsed.language !== record.language) {
-    note = "\n\n_(Note: AI summary yahan usi language mein hai jo pehli dafa generate hui thi - naya language ke liye symbol ke saath dubara pucho, e.g. '!market EURUSD analyse karo Roman Urdu mein'.)_";
+    note = "\n\n_(Note: yeh pichli analysis usi language mein hai jo pehli dafa generate hui thi - naya language ke liye symbol ke saath dubara pucho, e.g. '!market EURUSD analyse karo Roman Urdu mein'.)_";
   }
   return marketFormatting.renderWorkflowResult(record.result, { intent: 'analyze', compact: parsed.compact }) + note;
 }
@@ -99,9 +84,8 @@ function startHook(fn) {
 // completed-trades lifecycle) ----
 // A successful bot analysis IS a real deterministic binary-style signal -
 // same shape, same checkpoints/expiry/entryPrice, produced by the exact
-// same binaryEngine.generateBinarySignal() call that !analyze <symbol>
-// <duration> and !binary already register for tracking (see
-// commands/analyze.js and commands/binary.js). !market computed and
+// same binaryEngine.generateBinarySignal() call that !binary already
+// registers for tracking (see commands/binary.js). !market computed and
 // displayed that same signal but never called binaryStore.saveNew() on it,
 // so it never entered services/binaryTracker.js's OPEN set, never got
 // checkpointed against real price data, never closed as WIN/LOSS, and never
@@ -154,7 +138,7 @@ async function handleMarketCommand(scopeId, text, hooks = {}, deps = {}) {
 
   let result;
   try {
-    result = await (deps.runMarketWorkflow || runMarketWorkflow)(request, { mode: modeFor(parsed.intent), ...(deps.workflowOptions || {}) });
+    result = await (deps.runMarketWorkflow || runMarketWorkflow)(request, { ...(deps.workflowOptions || {}) });
   } catch (err) {
     // runMarketWorkflow never throws; this only guards an unexpected bug.
     logger.error(`!market workflow threw unexpectedly: ${err.stack || err.message}`);
