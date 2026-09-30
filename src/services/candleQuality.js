@@ -136,4 +136,61 @@ function analyzeLastCandle(candles) {
   };
 }
 
-module.exports = { bodyRange, classifySingle, isEngulfing, isInsideBar, consecutiveDirectional, rangeState, analyzeLastCandle };
+// ---- Classic single-candle pattern naming (real, geometry-only definitions) ----
+// These are textbook geometric definitions (body/wick ratios + prior-trend
+// context), not a statistical/learned claim - a name is only ever returned
+// when the actual measured geometry clears the stated thresholds. The SAME
+// geometry means a different name depending on what came before it (a
+// small-body, long-lower-wick candle is a bullish "Hammer" after a
+// downtrend, but a bearish "Hanging Man" after an uptrend) - so this always
+// needs the recent trend context, never just the one candle in isolation.
+function priorTrendDirection(candles) {
+  // A simple, real measure: net direction of the last few candles BEFORE
+  // the one being classified (close[-1] vs close[-N]) - not a prediction,
+  // just "what was actually happening going into this candle".
+  const n = Math.min(5, candles.length - 1);
+  if (n < 2) return null;
+  const from = candles[candles.length - 1 - n].close;
+  const to = candles[candles.length - 2].close; // up to (not including) the classified candle
+  if (!(from > 0)) return null;
+  const pct = (to - from) / from;
+  if (pct > 0.0003) return 'UP';
+  if (pct < -0.0003) return 'DOWN';
+  return null;
+}
+
+// `candles` must end at the candle being named; earlier candles provide
+// the trend context. Returns a real classic name, or null when the
+// geometry/context genuinely doesn't clear a named pattern's definition -
+// callers must show a generic description in that case, never invent one.
+function namedPatternFor(candles) {
+  if (candles.length < 3) return null;
+  const cur = candles[candles.length - 1];
+  const m = bodyRange(cur);
+  const trend = priorTrendDirection(candles.slice(0, -1).concat([cur]));
+
+  if (m.bodyRatio < 0.1) return 'Doji';
+  if (m.bodyRatio > 0.9) return m.bullish ? 'Bullish Marubozu' : 'Bearish Marubozu';
+
+  // Small body, one dominant wick >= 2x the body, other wick small.
+  const smallBody = m.bodyRatio < 0.35;
+  const lowerDominant = smallBody && m.lowerWick >= m.body * 2 && m.upperWick <= m.body * 0.5;
+  const upperDominant = smallBody && m.upperWick >= m.body * 2 && m.lowerWick <= m.body * 0.5;
+
+  if (lowerDominant) {
+    if (trend === 'DOWN') return 'Hammer';
+    if (trend === 'UP') return 'Hanging Man';
+    return null; // geometry matches but no clear prior trend to interpret it against - don't guess the name
+  }
+  if (upperDominant) {
+    if (trend === 'UP') return 'Shooting Star';
+    if (trend === 'DOWN') return 'Inverted Hammer';
+    return null;
+  }
+  if (smallBody && m.upperWickRatio > 0.25 && m.lowerWickRatio > 0.25) return 'Spinning Top';
+  return null; // a real, ordinary candle that doesn't match any classic named pattern - that's fine, most candles don't
+}
+
+module.exports = {
+  bodyRange, classifySingle, isEngulfing, isInsideBar, consecutiveDirectional, rangeState, analyzeLastCandle, namedPatternFor,
+};
