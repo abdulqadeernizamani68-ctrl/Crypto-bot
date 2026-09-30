@@ -8,18 +8,66 @@ function pctDiff(a, b) {
   return Number((((a - b) / b) * 100).toFixed(4));
 }
 
-function findPriceNear(candles, targetTime) {
+// ---- Exact-timestamp price resolution (section 11: "nearest candle" is not
+// automatically "the exact expiry price") ----
+// ---- Exact-timestamp price resolution (audit fix) ----
+// A 1-minute candle only ever gives TWO genuinely-observed prices for its
+// bar: its OPEN (the price at the bar's start instant) and its CLOSE (the
+// price at the bar's end instant, one minute later). The exact expiry
+// instant almost never lands exactly on either of those two points - it
+// falls SOMEWHERE inside the bar. Previously this always used the bar's
+// CLOSE, which for a target near the START of its bar could be labeled as
+// "the expiry price" while actually representing a price up to ~60s AFTER
+// the real expiry instant - i.e. the close of a LATER interval than
+// requested, exactly the mislabeling this fix addresses.
+//
+// The methodology now picks whichever of the covering bar's two real,
+// actually-observed prices (open or close) is TEMPORALLY CLOSER to the
+// exact target instant - this is NOT interpolation or fabrication (no
+// synthetic price is computed; only real recorded OHLC values are ever
+// used), it only changes WHICH of the two already-real endpoints is
+// reported, and bounds the worst-case reporting gap to ~30s instead of up
+// to ~60s. `referencePoint` and `gapMs` are always recorded alongside the
+// price so the actual observed endpoint and its distance from the true
+// target instant are never hidden - "exact" is never claimed beyond what
+// this resolution genuinely supports.
+const EXPIRY_PRICE_MAX_GAP_MS = 60 * 1000;
+// If the exact expiry price still cannot be reliably resolved this long
+// after the scheduled expiry (persistent data gap/provider outage), stop
+// waiting indefinitely and record the trade as NO_RESULT rather than
+// leaving it open forever or eventually guessing a stale price.
+const NO_RESULT_GRACE_MINUTES = 30;
+
+function findPriceAtExpiry(candles, targetTime) {
   if (!candles.length) return null;
-  let best = candles[0];
-  let bestDiff = Math.abs(candles[0].time - targetTime);
-  for (const c of candles) {
+  const covering = candles.find((c) => targetTime >= c.time && targetTime < c.time + 60000);
+  if (covering) {
+    const msSinceOpen = targetTime - covering.time;
+    const msUntilClose = (covering.time + 60000) - targetTime;
+    if (msSinceOpen <= msUntilClose) {
+      return {
+        price: covering.open, candleTime: covering.time, referencePoint: 'bar-open', gapMs: msSinceOpen, method: 'covering-1m-bar-nearest-real-endpoint',
+      };
+    }
+    return {
+      price: covering.close, candleTime: covering.time + 60000, referencePoint: 'bar-close', gapMs: msUntilClose, method: 'covering-1m-bar-nearest-real-endpoint',
+    };
+  }
+  let best = null;
+  let bestDiff = Infinity;
+  candles.forEach((c) => {
     const diff = Math.abs(c.time - targetTime);
     if (diff < bestDiff) {
       best = c;
       bestDiff = diff;
     }
+  });
+  if (best && bestDiff <= EXPIRY_PRICE_MAX_GAP_MS) {
+    return {
+      price: best.close, candleTime: best.time, referencePoint: 'nearest-bar-close', gapMs: targetTime - best.time, method: 'nearest-1m-bar-close-within-tolerance',
+    };
   }
-  return best;
+  return null; // no reliable price at the exact expiry instant - do not guess
 }
 
 async function checkOpenBinary(signal) {
@@ -55,19 +103,40 @@ async function checkOpenBinary(signal) {
       if (elapsedMinutes < cp.minutes) continue;
 
       const targetTime = signal.signalTime + cp.minutes * 60000;
-      const priceAt = findPriceNear(relevant, targetTime);
-      if (!priceAt) continue;
+      const resolved = findPriceAtExpiry(relevant, targetTime);
+      if (!resolved) continue; // not reliably resolvable yet - retry next cron cycle, never guess
 
-      const actualDirection = priceAt.close >= signal.entryPrice ? 'UP' : 'DOWN';
+      const priceAt = resolved.price;
+      const actualDirection = priceAt >= signal.entryPrice ? 'UP' : 'DOWN';
       const correct = actualDirection === cp.direction;
       // eslint-disable-next-line no-await-in-loop
       await binaryStore.recordCheckpointOutcome(cp.fraction, correct);
-      resolvedCheckpoints[cp.fraction] = { correct, priceAt: priceAt.close, actualDirection };
+      resolvedCheckpoints[cp.fraction] = {
+        correct, priceAt, actualDirection, resolutionMethod: resolved.method, resolutionGapMs: resolved.gapMs, resolutionReferencePoint: resolved.referencePoint,
+      };
       changed = true;
     }
 
     const finalCp = signal.checkpoints[signal.checkpoints.length - 1];
-    const expired = elapsedMinutes >= finalCp.minutes && resolvedCheckpoints[finalCp.fraction];
+    const finalResolved = !!resolvedCheckpoints[finalCp.fraction];
+    const expired = elapsedMinutes >= finalCp.minutes && finalResolved;
+
+    // Persistent data gap right at expiry: stop waiting after a generous
+    // grace period and record an honest NO_RESULT rather than an ever-open
+    // signal or a guessed price.
+    const pastGrace = elapsedMinutes >= finalCp.minutes + NO_RESULT_GRACE_MINUTES;
+    if (!finalResolved && pastGrace) {
+      logger.warn(`${signal.symbol} signal ${signal.id}: no reliable price at/near exact expiry (${new Date(signal.signalTime + finalCp.minutes * 60000).toISOString()}) after ${NO_RESULT_GRACE_MINUTES}min grace - recording NO_RESULT instead of guessing.`);
+      await binaryStore.close(signal.id, {
+        status: 'CLOSED',
+        result: 'NO_RESULT',
+        closePrice: null,
+        closedAt: now,
+        resolvedCheckpoints,
+        noResultReason: 'INSUFFICIENT_DATA_AT_EXPIRY',
+      });
+      return;
+    }
 
     if (expired) {
       const finalOutcome = resolvedCheckpoints[finalCp.fraction];
@@ -146,6 +215,20 @@ async function checkOpenBinary(signal) {
             }
           }
         }
+        // GROUP_WEIGHTS audit (#1): for each confluence group that had a
+        // real (non-zero) directional lean, record whether THAT group's
+        // own lean, on its own, agreed with the actual price outcome -
+        // real evidence for whether a group is genuinely independently
+        // predictive, never used to auto-adjust GROUP_WEIGHTS by itself.
+        if (signal.confluenceGroupScores) {
+          for (const [groupName, score] of Object.entries(signal.confluenceGroupScores)) {
+            if (typeof score !== 'number' || score === 0) continue; // no opinion from this group - nothing to grade
+            const groupDirection = score > 0 ? 'UP' : 'DOWN';
+            const groupAgreed = groupDirection === finalOutcome.actualDirection;
+            // eslint-disable-next-line no-await-in-loop
+            await calibrationSvc.recordGroupDirectionOutcome(groupName, groupAgreed);
+          }
+        }
       } catch (calibErr) {
         // Never let calibration bookkeeping failures block closing the
         // trade itself - the WIN/LOSS record above is the source of
@@ -174,4 +257,4 @@ async function runBinaryTrackerCycle() {
   }
 }
 
-module.exports = { runBinaryTrackerCycle };
+module.exports = { runBinaryTrackerCycle, findPriceAtExpiry };
