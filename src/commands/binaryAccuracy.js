@@ -7,7 +7,8 @@ const logger = require('../utils/logger');
 async function handleBinaryAccuracyCommand() {
   try {
     const all = await binaryStore.getAll();
-    const closed = all.filter((s) => s.status === 'CLOSED' && s.result);
+    const closed = all.filter((s) => s.status === 'CLOSED' && (s.result === 'WIN' || s.result === 'LOSS'));
+    const noResultCount = all.filter((s) => s.status === 'CLOSED' && s.result === 'NO_RESULT').length;
     const totalSignals = closed.length;
     const wins = closed.filter((s) => s.result === 'WIN').length;
     const losses = closed.filter((s) => s.result === 'LOSS').length;
@@ -31,11 +32,12 @@ async function handleBinaryAccuracyCommand() {
     const regimePerf = await calibrationSvc.getAllRegimePerf();
     const sessionPerf = await calibrationSvc.getAllSessionPerf();
     const featurePerf = await calibrationSvc.getAllFeaturePerf();
+    const groupPerf = await calibrationSvc.getAllGroupPerf();
     const expiryPriceAccuracy = await calibrationSvc.getAllExpiryPriceAccuracy();
 
     const parts = [
       formatBinaryStatsMessage({
-        totalSignals, wins, losses, winRate, checkpointAccuracy, expiryPerf, regimePerf, sessionPerf, featurePerf, expiryPriceAccuracy,
+        totalSignals, wins, losses, winRate, checkpointAccuracy, expiryPerf, regimePerf, sessionPerf, featurePerf, groupPerf, expiryPriceAccuracy, noResultCount,
       }),
     ];
 
