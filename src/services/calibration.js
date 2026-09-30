@@ -68,6 +68,11 @@ const KEYS = {
   // answered from real recorded outcomes, not assumed from theory.
   genericPerf: (category, key) => `binary:perf:${category}:${key}`,
   genericLabelsSeen: (category) => `binary:perf:${category}:labels`,
+  // Expected-expiry-price vs actual-expiry-price validation, tracked per
+  // expiry bucket alongside (never instead of) the direction-only win-rate
+  // above - a bot can be directionally right while its price target is
+  // systematically off, and that would never show up in win/loss alone.
+  expiryPriceAccuracy: (expiryBucketKey) => `binary:priceacc:expiry:${expiryBucketKey}`,
 };
 
 // How many of the most recent outcomes to keep per calibration bucket, for
@@ -176,9 +181,7 @@ async function getExpiryPerf(expiryBucketKey) {
 
 async function getAllExpiryPerf() {
   return Promise.all(allBucketKeys().map(getExpiryPerf));
-}
-
-async function getRegimePerf(regimeLabel) {
+}async function getRegimePerf(regimeLabel) {
   const stats = await readCounter(KEYS.regimePerf(regimeLabel));
   return {
     regime: regimeLabel,
@@ -243,6 +246,73 @@ async function getAllFeaturePerf() {
   return getAllGenericPerf('feature');
 }
 
+// ---- Per-confluence-group empirical tracking (GROUP_WEIGHTS audit) ----
+// binaryEngine.js's GROUP_WEIGHTS (TREND/MOMENTUM/PRICE_ACTION/etc) are
+// currently fixed, documented PRIORS - see the audit comment above their
+// definition. This records, from real settled trades only, whether each
+// group's OWN directional tilt (sign of its groupScore, independent of the
+// other groups) agreed with the ACTUAL price outcome - reusing the exact
+// same real-outcome win/loss counter recordFeatureOutcome already uses for
+// individual boolean flags, just keyed by group name. This never changes a
+// weight by itself; it only accumulates the real evidence ("did this group
+// actually have independent predictive value, on its own, in this bot's
+// real history") a future, deliberate weight change could point to.
+async function recordGroupDirectionOutcome(groupName, groupAgreedWithOutcome) {
+  return recordGenericPerf('group', groupName, groupAgreedWithOutcome);
+}
+async function getAllGroupPerf() {
+  return getAllGenericPerf('group');
+}
+
+// ---- Expected-expiry-price vs actual-expiry-price validation ----
+// Direction (win/loss) tracking above answers "was UP/DOWN right". It says
+// nothing about whether the model's actual *expected expiry price* target
+// (binaryEngine.js's expectedExpiryPrice, i.e. the final checkpoint's
+// predictedPrice) is anywhere near what price genuinely does at expiry - a
+// model can be directionally correct while its price target is
+// systematically biased (always overshoots) or simply noisy (high average
+// error even when unbiased). Both are tracked, per expiry bucket, from real
+// settled trades only - never estimated or assumed.
+async function readAccCounter(key) {
+  const raw = await store.redis.get(key);
+  const val = raw ? (typeof raw === 'string' ? JSON.parse(raw) : raw) : { count: 0, sumErrPct: 0, sumAbsErrPct: 0 };
+  return val;
+}
+
+// errPct is signed: positive means price at expiry finished HIGHER than the
+// model expected, negative means LOWER - so the running mean (biasPct) shows
+// a genuine systematic over/under-shoot rather than cancelling itself out.
+// maePct (mean absolute error) is the separate, always-positive "how far off
+// is it typically" number - a model can have biasPct near 0 while maePct is
+// still large (unbiased but noisy), which is exactly why both are kept.
+async function recordExpiryPriceAccuracy(expiryBucketKey, { entryPrice, predictedPrice, actualPrice }) {
+  if (!(entryPrice > 0) || !Number.isFinite(predictedPrice) || !Number.isFinite(actualPrice)) return null;
+  const errPct = ((actualPrice - predictedPrice) / entryPrice) * 100;
+  const key = KEYS.expiryPriceAccuracy(expiryBucketKey);
+  const val = await readAccCounter(key);
+  val.count += 1;
+  val.sumErrPct += errPct;
+  val.sumAbsErrPct += Math.abs(errPct);
+  await store.redis.set(key, JSON.stringify(val));
+  return val;
+}
+
+async function getExpiryPriceAccuracy(expiryBucketKey) {
+  const stats = await readAccCounter(KEYS.expiryPriceAccuracy(expiryBucketKey));
+  return {
+    expiryBucket: expiryBucketKey,
+    label: bucketLabel(expiryBucketKey),
+    sampleSize: stats.count,
+    biasPct: stats.count ? Number((stats.sumErrPct / stats.count).toFixed(4)) : null,
+    maePct: stats.count ? Number((stats.sumAbsErrPct / stats.count).toFixed(4)) : null,
+    lowConfidence: stats.count < MIN_SAMPLES_FOR_CONFIDENT_CALIBRATION,
+  };
+}
+
+async function getAllExpiryPriceAccuracy() {
+  return Promise.all(allBucketKeys().map(getExpiryPriceAccuracy));
+}
+
 module.exports = {
   getProbBin,
   calibrateProbability,
@@ -259,6 +329,11 @@ module.exports = {
   getAllSessionPerf,
   recordFeatureOutcome,
   getAllFeaturePerf,
+  recordGroupDirectionOutcome,
+  getAllGroupPerf,
+  recordExpiryPriceAccuracy,
+  getExpiryPriceAccuracy,
+  getAllExpiryPriceAccuracy,
   MIN_SAMPLES_FOR_CONFIDENT_CALIBRATION,
   RECENT_WINDOW_SIZE,
 };
