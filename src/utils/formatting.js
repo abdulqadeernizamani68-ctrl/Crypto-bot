@@ -30,8 +30,24 @@ function formatBinarySignalMessage(signal, opts = {}) {
     `Direction: *${signal.direction}*${signal.direction === 'NO_TRADE' ? ' (no trade taken)' : ''}`,
     `Entry Price: ${fmtNum(signal.entryPrice)}`,
     `Expiry: ${durationLabel} (bucket: ${signal.expiryBucket.label})`,
-    `Expires At: ${signal.expiresAtIso} (exact expiry timestamp - the binary result is decided by price AT this instant, not before)`,
+    `Expires At: ${signal.expiresAtIso} (target expiry instant - resolved at settlement from the nearest real 1-minute-bar open/close within ~30s of this instant; see README for the exact-timestamp methodology and its resolution limit)`,
     `Market Regime: ${regimeLine(signal.regime)}`,
+  ];
+
+  // ---- Requested-expiry vs alternative-expiry evaluation ----
+  const sel = signal.expirySelection;
+  if (sel) {
+    lines.push('', `Requested Expiry Assessment: ${sel.requestedAssessment}`);
+    if (sel.alternative) {
+      lines.push(
+        `⚠️ Alternative Expiry: ${sel.alternative.label} has materially stronger validated evidence - ${sel.alternative.reasons.join('; ')}.`
+      );
+    } else if (sel.note) {
+      lines.push(sel.note);
+    }
+  }
+
+  lines.push(
     '',
     `Model (raw) Probability: ${signal.rawProbability}% - this is what the drift/volatility math computed, NOT a claim about real-world accuracy`,
     `Calibrated Probability: ${signal.calibratedProbability}%` +
@@ -40,7 +56,7 @@ function formatBinarySignalMessage(signal, opts = {}) {
       (signal.calibrationRecentSampleSize
         ? ` [recent ${signal.calibrationRecentSampleSize}: ${signal.calibrationRecentWinRatePct}%]`
         : ''),
-  ];
+  );
 
   if (expiryPerf && expiryPerf.total > 0) {
     lines.push(
@@ -147,13 +163,27 @@ function formatBinarySignalMessage(signal, opts = {}) {
     ''
   );
 
-  if (signal.timeframeSuggestion) {
-    lines.push(
-      `💡 Note: this pair's price action currently looks cleaner on a **${signal.timeframeSuggestion.label}** basis ` +
-      `(quality ${signal.timeframeSuggestion.quality} vs ${signal.timeframeSuggestion.nativeQuality} on the requested duration) - ` +
-      'consider that range if you have flexibility on duration.',
-      ''
-    );
+  if (signal.nextCandleForecast) {
+    const ncf = signal.nextCandleForecast;
+    lines.push('', `*Next-Candle Forecast* (NEXT CANDLE TIMEFRAME: ${ncf.timeframeLabel} - a separate layer; this does NOT override the expiry decision above):`);
+    if (signal.recentCandles?.length) {
+      const recentStr = signal.recentCandles.map((c, i) => {
+        const label = i === signal.recentCandles.length - 1 ? 'current' : 'previous';
+        return `${label}: ${c.color}${c.namedPattern ? ` (${c.namedPattern})` : ''}`;
+      }).join(' | ');
+      lines.push(`- Recent candles at this timeframe: ${recentStr}`);
+    }
+    if (ncf.probabilityGreenPct == null) {
+      lines.push(`- Direction: UNCERTAIN - ${ncf.expectedStructure}`);
+    } else {
+      lines.push(
+        `- Direction: ${ncf.direction} (green ${ncf.probabilityGreenPct}% / red ${ncf.probabilityRedPct}%), confidence ${ncf.confidence}`,
+        `- Expected Structure: ${ncf.expectedStructure}`,
+        `- Expected Open/Close: ${fmtNum(ncf.expectedOpen)} -> ${fmtNum(ncf.expectedClose)} (${ncf.expectedMovePct >= 0 ? '+' : ''}${ncf.expectedMovePct}%)`,
+        `- Expected High/Low: ${fmtNum(ncf.expectedHigh)} - ${fmtNum(ncf.expectedLow)}`,
+        `- Key evidence: ${ncf.evidence.slice(0, 2).join('; ')}`
+      );
+    }
   }
 
   if (signal.direction !== 'NO_TRADE') {
@@ -187,6 +217,7 @@ function formatBinaryStatsMessage(stats) {
     `Wins: ${stats.wins}`,
     `Losses: ${stats.losses}`,
     `Overall Win Rate: ${stats.winRate}% (this is the actual historical win rate, not a model probability)`,
+    `No-Result (expiry price could not be reliably resolved): ${stats.noResultCount || 0}`,
   ];
 
   if (stats.expiryPerf?.length) {
@@ -239,6 +270,14 @@ function formatBinaryStatsMessage(stats) {
       lines.push(`- ${f.key}: ${f.winRatePct}% (n=${f.total})${flag}`);
     });
     lines.push('  (compare "<flag>:true" vs "<flag>:false" rows for the same flag to see if it actually helps)');
+  }
+
+  if (stats.groupPerf?.length) {
+    lines.push('', 'Confluence-group standalone accuracy (real settled trades: how often each group\'s OWN lean matched the actual outcome - evidence for/against the fixed GROUP_WEIGHTS priors, which are NOT auto-adjusted from this):');
+    stats.groupPerf.forEach((g) => {
+      const flag = g.total < 30 ? ' (small sample - not enough to justify changing any weight)' : '';
+      lines.push(`- ${g.key}: ${g.winRatePct}% (n=${g.total})${flag}`);
+    });
   }
 
   lines.push(
