@@ -84,6 +84,8 @@ const candleQualitySvc = require('./candleQuality');
 const divergenceSvc = require('./divergence');
 const sessionsSvc = require('./sessions');
 const dataQualitySvc = require('./dataQuality');
+const expirySelectionSvc = require('./expirySelection');
+const nextCandleSvc = require('./nextCandle');
 
 function normalCdf(x) {
   // Verified against known values: normalCdf(0) = 0.5, normalCdf(2) ≈ 0.977,
@@ -93,6 +95,97 @@ function normalCdf(x) {
   let prob = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
   if (x > 0) prob = 1 - prob;
   return prob; // P(Z <= x)
+}
+
+// ---- Student's t-distribution CDF (regularized incomplete beta function) ----
+// Standard textbook numerical algorithm (Lanczos gamma approximation +
+// Numerical Recipes' continued-fraction incomplete beta) - the same
+// algorithm R's pt(), Python's scipy.stats.t.cdf(), etc. use. Not specific
+// to this app and nothing in it is a tuned/app-specific constant.
+//
+// WHY this replaces normalCdf for reading off a probability: z = mean/sd is
+// built from an ESTIMATED mean and an ESTIMATED standard deviation (both
+// computed from a finite window of real returns), not known population
+// values. Treating that as a standard normal always understates how
+// uncertain the estimate itself is - with few observations, a clean-looking
+// run of returns can produce a large |z| purely by chance, and normalCdf
+// would report that as near-100%/0% certainty. The t-distribution's fatter
+// tails are the standard correction for exactly this (estimated-variance)
+// situation: they automatically make the same |z| read as LESS extreme when
+// degrees of freedom (df = number of return observations - 1) are small,
+// and converge to the normal-distribution answer as df grows - there is no
+// fixed ceiling/floor anywhere in this; it is purely a function of how much
+// real data actually supports the estimate.
+function logGamma(x) {
+  const g = 7;
+  const c = [
+    0.99999999999980993, 676.5203681218851, -1259.1392167224028,
+    771.32342877765313, -176.61502916214059, 12.507343278686905,
+    -0.13857109526572012, 9.9843695780195716e-6, 1.5056327351493116e-7,
+  ];
+  if (x < 0.5) return Math.log(Math.PI / Math.sin(Math.PI * x)) - logGamma(1 - x);
+  const xm1 = x - 1;
+  let a = c[0];
+  const t = xm1 + g + 0.5;
+  for (let i = 1; i < g + 2; i += 1) a += c[i] / (xm1 + i);
+  return 0.5 * Math.log(2 * Math.PI) + (xm1 + 0.5) * Math.log(t) - t + Math.log(a);
+}
+
+function betacf(x, a, b) {
+  const MAXIT = 200;
+  const EPS = 3e-9;
+  const FPMIN = 1e-300;
+  const qab = a + b;
+  const qap = a + 1;
+  const qam = a - 1;
+  let c = 1;
+  let d = 1 - (qab * x) / qap;
+  if (Math.abs(d) < FPMIN) d = FPMIN;
+  d = 1 / d;
+  let h = d;
+  for (let m = 1; m <= MAXIT; m += 1) {
+    const m2 = 2 * m;
+    let aa = (m * (b - m) * x) / ((qam + m2) * (a + m2));
+    d = 1 + aa * d;
+    if (Math.abs(d) < FPMIN) d = FPMIN;
+    c = 1 + aa / c;
+    if (Math.abs(c) < FPMIN) c = FPMIN;
+    d = 1 / d;
+    h *= d * c;
+    aa = (-(a + m) * (qab + m) * x) / ((a + m2) * (qap + m2));
+    d = 1 + aa * d;
+    if (Math.abs(d) < FPMIN) d = FPMIN;
+    c = 1 + aa / c;
+    if (Math.abs(c) < FPMIN) c = FPMIN;
+    d = 1 / d;
+    const del = d * c;
+    h *= del;
+    if (Math.abs(del - 1) < EPS) break;
+  }
+  return h;
+}
+
+function regularizedIncompleteBeta(x, a, b) {
+  if (x <= 0) return 0;
+  if (x >= 1) return 1;
+  const bt = Math.exp(
+    logGamma(a + b) - logGamma(a) - logGamma(b) + a * Math.log(x) + b * Math.log(1 - x)
+  );
+  if (x < (a + 1) / (a + b + 2)) return (bt * betacf(x, a, b)) / a;
+  return 1 - (bt * betacf(1 - x, b, a)) / b;
+}
+
+// P(T <= t) for a Student's t distributed variable with `df` degrees of
+// freedom. Falls back to normalCdf when df is not usable (e.g. too few
+// observations to define a t-distribution at all) - that fallback is a
+// mathematical necessity (df must be > 0), not a confidence shortcut, and
+// it still goes through the SAME probability pipeline either way.
+function studentTCdf(t, df) {
+  if (!Number.isFinite(t) || !Number.isFinite(df) || df <= 0) return normalCdf(t);
+  if (df > 1000) return normalCdf(t); // numerically indistinguishable from normal at this point anyway
+  const x = df / (df + t * t);
+  const ib = regularizedIncompleteBeta(x, df / 2, 0.5);
+  return t >= 0 ? 1 - 0.5 * ib : 0.5 * ib;
 }
 
 function logReturns(closes) {
@@ -165,6 +258,39 @@ function srProximityScore(entryPrice, nearest) {
 // forex pair with no volume data simply redistributes VOLUME's weight
 // across the groups that DID have data - it never silently zeroes out
 // part of the read.
+//
+// ---- Scientific audit of these 7 constants (what's legitimate vs
+// arbitrary, and why nothing below was changed) ----
+// None of these 7 numbers has been empirically validated against this
+// bot's OWN real settled trades - as of this audit, the Redis calibration
+// store has zero live history, so there is no walk-forward/out-of-sample
+// evidence to optimize against yet. Re-deriving them from nothing would be
+// fake optimization, exactly what the audit that produced this comment was
+// told not to do. What IS legitimate here:
+//   - The RELATIVE ORDERING (TREND > PRICE_ACTION > MOMENTUM >
+//     MEAN_REVERSION > VOLUME > DIVERGENCE > CANDLE_QUALITY) reflects
+//     conventional, widely-documented technical-analysis practice: trend
+//     and price structure are generally treated as primary/leading
+//     evidence, momentum/mean-reversion as confirming/secondary, and
+//     volume/divergence/single-candle-geometry as the weakest standalone
+//     signals (notoriously noisy and lagging on their own) - this is a
+//     defensible PRIOR, not an invented one, but it is still a prior, not
+//     a fitted parameter.
+//   - The auto-renormalization mechanic (weightUsed below) IS a real
+//     mathematical necessity, not arbitrary: without it, missing data for
+//     any one group would silently understate the total evidence instead
+//     of correctly redistributing weight to what's actually available.
+//   - What is NOT yet true: that these exact numbers (0.30 vs e.g. 0.28,
+//     0.17 vs 0.20, ...) are the empirically optimal weights for this
+//     specific engine's actual predictive accuracy. That claim would
+//     require real closed-trade history to test.
+// getAllGroupPerf() (calibration.js) now tracks, from REAL settled trades
+// only, whether each group's own directional tilt agreed with the actual
+// outcome - visible via !binaryaccuracy. Once a meaningful sample
+// accumulates per group, that is the evidence a future weight change
+// would need to cite; until then, these stay fixed & explicitly documented
+// as priors rather than being dressed up as "proven optimal" or silently
+// adjusted without evidence.
 const GROUP_WEIGHTS = {
   TREND: 0.30,
   MOMENTUM: 0.17,
@@ -291,31 +417,12 @@ function resampleCandles(candles, factor) {
   return out;
 }
 
-function confluenceQuality(candles) {
-  if (candles.length < 30) return 0;
-  const adxVal = indicators.adx(candles, 14);
-  const adxStrength = adxVal && Number.isFinite(adxVal.adx) ? Math.max(0, Math.min(1, (adxVal.adx - 15) / 15)) : 0;
-  const structureInfo = structureSvc.classifyStructure(candles);
-  return (adxStrength + Math.abs(structureInfo.score)) / 2;
-}
+// NOTE: the old confluenceQuality()/suggestBetterTimeframe() cosmetic
+// "quality score" timeframe hint has been removed entirely - replaced by
+// the real, evidence-based expirySelection.js (calibrated probability +
+// historical accuracy + expiry-price error + MTF agreement, gated on a
+// material-margin threshold). See generateBinarySignal below.
 
-function suggestBetterTimeframe(candles) {
-  const nativeQuality = confluenceQuality(candles);
-  const candidates = [
-    { label: '5-15 minute', factor: 5, minCandles: 60 },
-    { label: '15-60 minute', factor: 15, minCandles: 60 },
-  ];
-  let best = null;
-  for (const c of candidates) {
-    const resampled = resampleCandles(candles, c.factor);
-    if (resampled.length < c.minCandles) continue;
-    const quality = confluenceQuality(resampled);
-    if (quality > nativeQuality + 0.15 && (!best || quality > best.quality)) {
-      best = { label: c.label, quality: Number(quality.toFixed(2)), nativeQuality: Number(nativeQuality.toFixed(2)) };
-    }
-  }
-  return best;
-}
 
 // How many raw 1-minute candles are needed so the higher-timeframe resample
 // below actually has enough bars to compute a meaningful confluence read
@@ -485,6 +592,16 @@ function requiredFetchSize(duration, statsLookback) {
   return Math.max(statsLookback, mtfCandlesNeeded(duration));
 }
 
+// Single source of truth for how much lookback (in minutes) drift/volatility
+// are measured over, given a duration - shared by fetchSignalInputs (for the
+// requested duration) and expirySelection.js (for each alternative candidate
+// duration it evaluates), so a candidate's stats window is computed by the
+// exact same rule the live requested-duration signal uses, never a
+// simplified stand-in.
+function computeStatsLookback(duration) {
+  return Math.max(60, config.binary.lookbackMinutesForStats, Math.min(720, Math.ceil(duration * 1.5)));
+}
+
 // ---- Pure core: everything that can be computed from a candle array +
 // entry price + duration alone, with NO network calls and NO Redis/
 // calibration lookups. This is the exact same math the live path uses
@@ -526,6 +643,52 @@ function computeSignalCore(allCandlesRaw, entryPrice, duration, statsLookback) {
   // real data - see each service's own honesty note) ----
   const volumeState = volumeSvc.computeVolumeState(candles);
   const candleQuality = candleQualitySvc.analyzeLastCandle(candles);
+  // ---- Next-candle forecast (separate layer - see nextCandle.js header
+  // for the full methodology). Timeframe is NEVER hardcoded to 1-minute:
+  // it reuses mtfFactorFor(duration) - the SAME existing, already-justified
+  // parameter the engine uses to pick its own higher-timeframe MTF context
+  // for this expiry - so "next candle" is always explicitly labeled with a
+  // real, context-relevant timeframe, never a silently-mismatched 1-minute
+  // guess, and never a newly-invented arbitrary choice either. It computes
+  // its OWN independent drift/vol from that timeframe's own real returns
+  // (never reused/rescaled from the expiry-level driftPerMin/volPerMin
+  // above), so it can never mechanically inflate or be inflated by the
+  // expiry-level probability. Never influences the expiry decision below -
+  // attached to the signal purely as its own, separately-labeled forecast.
+  const nextCandleTimeframe = mtfFactorFor(duration) || 1;
+  const nextCandleSeries = nextCandleTimeframe === 1 ? candles : resampleCandles(allCandles, nextCandleTimeframe);
+  const nextCandleQuality = nextCandleTimeframe === 1
+    ? candleQuality
+    : (nextCandleSeries.length ? candleQualitySvc.analyzeLastCandle(nextCandleSeries) : null);
+  const nextCandleForecast = nextCandleSvc.forecastNextCandle({
+    candles: nextCandleSeries,
+    timeframeMinutes: nextCandleTimeframe,
+    candleQuality: nextCandleQuality,
+    studentTCdf,
+    logReturns,
+    mean,
+    stdev,
+  });
+
+  // ---- Real, already-observed recent candles at the SAME timeframe as the
+  // next-candle forecast above - purely descriptive (no prediction here),
+  // so the user can see what actually just happened before reading what's
+  // forecast to happen next. `namedPatternFor` only returns a classic name
+  // (Hammer/Doji/Shooting Star/etc) when the real geometry + real prior
+  // trend context genuinely match its textbook definition - null otherwise.
+  const recentCandles = (() => {
+    if (nextCandleSeries.length < 2) return [];
+    const out = [];
+    for (let idx = nextCandleSeries.length - 2; idx <= nextCandleSeries.length - 1; idx += 1) {
+      const c = nextCandleSeries[idx];
+      out.push({
+        time: c.time,
+        color: c.close > c.open ? 'GREEN' : c.close < c.open ? 'RED' : 'FLAT',
+        namedPattern: candleQualitySvc.namedPatternFor(nextCandleSeries.slice(0, idx + 1)),
+      });
+    }
+    return out; // [previous, current], oldest first
+  })();
   const divergences = divergenceSvc.detectDivergences(candles, volumeState);
   // Session is classified from the LAST CANDLE's own timestamp, not
   // wall-clock "now" - this is what makes it work correctly inside the
@@ -548,7 +711,6 @@ function computeSignalCore(allCandlesRaw, entryPrice, duration, statsLookback) {
     lookback: 15,
   });
   const regimeInfo = regimeSvc.classifyRegime(candles, structureInfo, breakoutInfo, volumeState);
-  const timeframeSuggestion = suggestBetterTimeframe(candles);
 
   // A breakout's contribution to the confluence tilt is scaled by its own
   // `quality` (0-1, from analyzeBreakoutQuality) - an unconfirmed/no-
@@ -566,18 +728,43 @@ function computeSignalCore(allCandlesRaw, entryPrice, duration, statsLookback) {
   });
   const mtf = computeMultiTimeframeConfluence(allCandles, duration, nativeConfluence, srScore, breakoutContribScore);
   const tilt = mtf.tilt;
-  const adjustedDrift = reliableDrift + tilt * volPerMin;
+  // ---- Same shrinkage logic as reliableDrift above, applied to the
+  // confluence tilt (audit finding: previously tilt was added at FULL
+  // weight with no uncertainty discount at all, and empirically turned out
+  // to be the DOMINANT driver of overconfident probabilities on
+  // well-sampled long-duration signals - the t-distribution fix on its own
+  // only helps when the SAMPLE SIZE is small, not when a strong tilt reading
+  // combines with a large, low-noise statsLookback window). ----
+  // `tilt` is built by averaging/weighting `nativeConfluence.factorCount`
+  // roughly-independent indicator readings (buildConfluence) - treating it
+  // like the mean of that many noisy, unit-scale observations, its own
+  // standard error scales the same way a sample mean's does: ~1/sqrt(n).
+  // This is the same statistical reasoning as driftStdErr above (Central
+  // Limit Theorem for a mean of N roughly-independent readings), applied to
+  // a genuinely different real quantity (nativeConfluence.factorCount) -
+  // not a copy of the same number, and not a new tuned constant.
+  const tiltStdErr = 1 / Math.sqrt(Math.max(1, nativeConfluence.factorCount));
+  const tiltReliability = (tilt * tilt) / (tilt * tilt + tiltStdErr * tiltStdErr);
+  const reliableTilt = tilt * tiltReliability;
+  const adjustedDrift = reliableDrift + reliableTilt * volPerMin;
 
   function decayedDrift(t) {
     return adjustedDrift * (statsLookback / (statsLookback + t));
   }
+
+  // Degrees of freedom for the checkpoint probabilities below: the number
+  // of real return observations the drift/vol estimate is actually built
+  // from, minus 1 - NOT a tuned constant, it is read directly off the real
+  // data used for this signal. See studentTCdf's own comment for why this
+  // replaces a plain normal-distribution read.
+  const driftVolDf = rets.length - 1;
 
   const checkpoints = config.binary.checkpointFractions.map((frac) => {
     const t = duration >= 1 ? Math.max(1, Math.round(duration * frac)) : Math.max(1 / 60, duration * frac);
     const meanLogRet = decayedDrift(t) * t;
     const sdLogRet = volPerMin * Math.sqrt(t);
     const z = sdLogRet > 0 ? meanLogRet / sdLogRet : (meanLogRet > 0 ? 5 : meanLogRet < 0 ? -5 : 0);
-    const probAbove = normalCdf(z);
+    const probAbove = studentTCdf(z, driftVolDf);
     const direction = probAbove >= 0.5 ? 'UP' : 'DOWN';
     const probability = direction === 'UP' ? probAbove : 1 - probAbove;
     const predictedPrice = entryPrice * Math.exp(meanLogRet);
@@ -619,6 +806,8 @@ function computeSignalCore(allCandlesRaw, entryPrice, duration, statsLookback) {
     dataQuality: dq,
     volumeState,
     candleQuality,
+    nextCandleForecast,
+    recentCandles,
     divergences,
     session,
     structureInfo,
@@ -626,7 +815,6 @@ function computeSignalCore(allCandlesRaw, entryPrice, duration, statsLookback) {
     nearestSR,
     breakoutInfo,
     regimeInfo,
-    timeframeSuggestion,
     nativeConfluence,
     mtf,
     tilt,
@@ -654,7 +842,7 @@ async function fetchSignalInputs(symbolRaw, durationMinutes) {
     Math.min(config.binary.maxDurationMinutes, durationMinutes)
   );
 
-  const statsLookback = Math.max(60, config.binary.lookbackMinutesForStats, Math.min(720, Math.ceil(duration * 1.5)));
+  const statsLookback = computeStatsLookback(duration);
   const fetchSize = requiredFetchSize(duration, statsLookback);
 
   const [candles, livePriceResult] = await Promise.all([
@@ -697,6 +885,71 @@ async function fetchSignalInputs(symbolRaw, durationMinutes) {
   };
 }
 
+// ---- Lean duration evaluation, for ALTERNATIVE-EXPIRY comparison only ----
+// Runs the exact same real pipeline (computeSignalCore -> calibration ->
+// decideFinalSignal) a candidate duration would get if it were the actual
+// requested signal - same math, same calibration lookups, same NO_TRADE
+// gating, nothing simplified or approximated. It just assembles a smaller
+// result (no per-candidate structure/breakout/SR display objects) because
+// alternative candidates are only ever used for scoring/comparison in
+// expirySelection.js, never shown to the user as a full standalone signal -
+// the requested duration's own full result (built inline in
+// generateBinarySignal below) is unaffected by this and unchanged.
+async function evaluateDurationLean(allCandles, entryPrice, duration, statsLookback, staleness) {
+  const core = computeSignalCore(allCandles, entryPrice, duration, statsLookback);
+  const {
+    dataQuality, structureInfo, breakoutInfo, regimeInfo, nativeConfluence, mtf, finalCp, rawDirection, rawProbability,
+  } = core;
+
+  const expiryBucket = expiryBucketsSvc.getExpiryBucket(duration);
+  const calib = await calibrationSvc.calibrateProbability(rawProbability, expiryBucket.key);
+  let calibratedPct = calib.calibratedPct;
+  if (mtf.agreement === false && duration >= 10) {
+    calibratedPct = 50 + (calibratedPct - 50) * (1 - config.binary.mtfDisagreementPenalty);
+  }
+
+  const decision = decideFinalSignal({
+    rawDirection,
+    calibratedPct,
+    regimeInfo,
+    factorCount: nativeConfluence.factorCount,
+    mtfAgreement: mtf.agreement,
+    duration,
+    statsLookback,
+    calibrationSampleSize: calib.sampleSize,
+    dataQuality,
+    structureInfo,
+    breakoutInfo,
+    groupScores: nativeConfluence.groupScores,
+  });
+
+  let finalDirection = decision.direction;
+  if (staleness && staleness.stale && finalDirection !== 'NO_TRADE') {
+    finalDirection = 'NO_TRADE';
+  }
+
+  const expectedExpiryPrice = finalCp.predictedPrice;
+  const expectedMoveAmount = Number.isFinite(expectedExpiryPrice) ? Number((expectedExpiryPrice - entryPrice).toPrecision(8)) : null;
+  const expectedMovePct = Number.isFinite(expectedExpiryPrice) && entryPrice > 0
+    ? Number((((expectedExpiryPrice - entryPrice) / entryPrice) * 100).toFixed(4))
+    : null;
+
+  return {
+    durationMinutes: duration,
+    expiryBucket,
+    direction: finalDirection,
+    calibratedProbability: Number(calibratedPct.toFixed(1)),
+    calibrationSampleSize: calib.sampleSize,
+    calibrationLowConfidence: calib.lowConfidence,
+    mtfAgreement: mtf.agreement,
+    expectedExpiryPrice,
+    expectedMoveAmount,
+    expectedMovePct,
+    expectedRangeLow: finalCp.rangeLow,
+    expectedRangeHigh: finalCp.rangeHigh,
+  };
+}
+
 // `prefetchedInputs` (optional) is the object returned by fetchSignalInputs
 // - pass it to reuse an already-fetched snapshot instead of fetching again.
 async function generateBinarySignal(symbolRaw, durationMinutes, prefetchedInputs = null) {
@@ -709,7 +962,7 @@ async function generateBinarySignal(symbolRaw, durationMinutes, prefetchedInputs
   const {
     driftPerMin, volPerMin, dataQuality, volumeState, candleQuality, divergences, session,
     structureInfo, srLevels, nearestSR, breakoutInfo, regimeInfo,
-    timeframeSuggestion, nativeConfluence, mtf, tilt, checkpoints, finalCp, featureFlags, rawDirection, rawProbability,
+    nativeConfluence, mtf, tilt, checkpoints, finalCp, featureFlags, rawDirection, rawProbability, nextCandleForecast, recentCandles,
   } = core;
 
   const expiryBucket = expiryBucketsSvc.getExpiryBucket(duration);
@@ -776,6 +1029,33 @@ async function generateBinarySignal(symbolRaw, durationMinutes, prefetchedInputs
     ? Number((((expectedExpiryPrice - entryPrice) / entryPrice) * 100).toFixed(4))
     : null;
 
+  // ---- Requested-expiry vs alternative-expiry evaluation (replaces the
+  // old cosmetic "quality score" timeframeSuggestion hint entirely - see
+  // expirySelection.js for why) ----
+  const expirySelection = await expirySelectionSvc.evaluateExpiryOptions({
+    requestedDuration: duration,
+    requestedEvaluation: {
+      durationMinutes: duration,
+      expiryBucket,
+      direction: finalDirection,
+      calibratedProbability: Number(calibratedPct.toFixed(1)),
+      calibrationSampleSize: calib.sampleSize,
+      mtfAgreement: mtf.agreement,
+      expectedExpiryPrice,
+      expectedMoveAmount,
+      expectedMovePct,
+    },
+    evaluateCandidate: (candidateDuration) => evaluateDurationLean(
+      candles,
+      entryPrice,
+      candidateDuration,
+      computeStatsLookback(candidateDuration),
+      staleness
+    ),
+    availableCandleCount: candles.length,
+    mtfCandlesNeededFn: mtfCandlesNeeded,
+  });
+
   return {
     symbol: symbolRaw.toUpperCase(),
     entryPrice,
@@ -815,6 +1095,8 @@ async function generateBinarySignal(symbolRaw, durationMinutes, prefetchedInputs
     } : null,
     volume: volumeState,
     candleQuality,
+    nextCandleForecast,
+    recentCandles,
     divergences,
     session,
     regime: regimeInfo,
@@ -824,7 +1106,8 @@ async function generateBinarySignal(symbolRaw, durationMinutes, prefetchedInputs
     volatilityRegime: { regime: regimeInfo.volatility, percentile: regimeInfo.volatilityPercentile },
     dataQualityIssues: dataQuality.issues,
     featureFlags,
-    timeframeSuggestion,
+    expirySelection,
+    modelVersion: config.analyticsVersion,
     checkpoints,
     finalCheckpoint: finalCp,
     signalTime,
@@ -843,9 +1126,13 @@ module.exports = {
   fetchSignalInputs,
   computeSignalCore,
   requiredFetchSize,
+  computeStatsLookback,
+  mtfCandlesNeeded,
+  evaluateDurationLean,
   buildConfluence,
   decideFinalSignal,
   normalCdf,
+  studentTCdf,
   formatMinutes,
   logReturns,
   mean,
