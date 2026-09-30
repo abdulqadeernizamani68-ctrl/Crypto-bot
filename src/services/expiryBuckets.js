@@ -34,4 +34,17 @@ function bucketLabel(key) {
   return BUCKETS.find((b) => b.key === key)?.label || key;
 }
 
-module.exports = { getExpiryBucket, allBucketKeys, bucketLabel, BUCKETS };
+// A representative pool of "natural" duration candidates spanning every
+// bucket above. This is NOT a preference order and is not itself the
+// selection logic - it is just the pool services/expirySelection.js draws
+// candidates from before filtering/scoring them on real evidence. Keeping
+// it here (not duplicated in expirySelection.js) means the candidate pool
+// and the bucket boundaries it's meant to span can never drift apart.
+const REPRESENTATIVE_MINUTES = [1, 2, 3, 5, 7, 10, 15, 20, 30, 45, 60, 90, 120, 180, 240, 360, 480, 720, 1440];
+function representativeMinutes() {
+  return REPRESENTATIVE_MINUTES.slice();
+}
+
+module.exports = {
+  getExpiryBucket, allBucketKeys, bucketLabel, representativeMinutes, BUCKETS,
+};
